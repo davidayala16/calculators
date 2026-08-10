@@ -1,0 +1,79 @@
+name: deploy-pages
+
+# Builds every app under apps/*, publishes each to its own path (apps/foo -> /foo/), and
+# generates a landing page linking to all of them — adding a new calculator needs no changes
+# here, it just needs to exist under apps/ with a matching `base` in its vite.config.js.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Build every app and assemble the site
+        run: |
+          set -e
+          mkdir -p site
+          links=""
+          for dir in apps/*/; do
+            name=$(basename "$dir")
+            echo "== Building $name =="
+            (cd "$dir" && npm ci && npm run build)
+            mkdir -p "site/$name"
+            cp -r "$dir/dist/." "site/$name/"
+            links="$links<li><a href=\"./$name/\">$name</a></li>"
+          done
+          cat > site/index.html <<HTML
+          <!doctype html>
+          <html lang="en">
+          <head>
+            <meta charset="utf-8" />
+            <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+            <title>Financial Calculators</title>
+            <style>
+              body { font-family: system-ui, sans-serif; max-width: 640px; margin: 60px auto; padding: 0 20px; background: #0D1B2A; color: #ECE6D6; }
+              h1 { font-size: 28px; }
+              ul { line-height: 2; }
+              a { color: #C9A24B; }
+            </style>
+          </head>
+          <body>
+            <h1>Financial Calculators</h1>
+            <ul>$links</ul>
+          </body>
+          </html>
+          HTML
+
+      - uses: actions/configure-pages@v5
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
