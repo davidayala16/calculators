@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from 'recharts';
 import GradientSlider from './GradientSlider.jsx';
-import { simulateRentVsBuy, monthlyMortgagePayment } from './model.js';
+import { simulateRentVsBuy, monthlyMortgagePayment, computeSliderDirections } from './model.js';
 
 const INK = "#12141C";
 const PANEL = "#1B1F2B";
@@ -33,6 +33,26 @@ const DEFAULTS = {
   rentersInsuranceMonthly: 15,
   marginalTaxRatePct: 24, standardDeductionAnnual: 29200, itemizeDeductions: false,
   uiMode: "basic",
+};
+
+// Shared with computeSliderDirections() so the sensitivity nudge always matches what's on
+// screen — every slider below should pull its min/max from here rather than a hardcoded
+// literal, so the two never drift apart.
+const FIELD_RANGES = {
+  homePrice: { min: 100000, max: 2000000 },
+  downPaymentPct: { min: 0, max: 100 },
+  mortgageRatePct: { min: 0, max: 12 },
+  monthlyRent: { min: 500, max: 10000 },
+  yearsToStay: { min: 1, max: 40 },
+  investmentReturnPct: { min: 0, max: 15 },
+  homeAppreciationPct: { min: -5, max: 10 },
+  propertyTaxPct: { min: 0, max: 4 },
+  maintenancePct: { min: 0, max: 4 },
+  pmiPct: { min: 0, max: 2 },
+  closingCostBuyPct: { min: 0, max: 8 },
+  closingCostSellPct: { min: 0, max: 10 },
+  rentGrowthPct: { min: 0, max: 10 },
+  marginalTaxRatePct: { min: 0, max: 50 },
 };
 
 function RentVsBuyCalculator() {
@@ -172,14 +192,16 @@ function RentVsBuyCalculator() {
     setItemizeDeductions(DEFAULTS.itemizeDeductions); setUiMode(DEFAULTS.uiMode);
   };
 
-  const result = useMemo(() => simulateRentVsBuy({
+  const currentInputs = {
     homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
     propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
     closingCostBuyPct, closingCostSellPct,
     monthlyRent, rentGrowthPct, rentersInsuranceMonthly,
     investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
     yearsToStay,
-  }), [
+  };
+
+  const result = useMemo(() => simulateRentVsBuy(currentInputs), [
     homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
     propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
     closingCostBuyPct, closingCostSellPct,
@@ -187,6 +209,21 @@ function RentVsBuyCalculator() {
     investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
     yearsToStay,
   ]);
+
+  // Recomputed on every relevant input change (see computeSliderDirections in model.js) so
+  // each slider's gradient direction always reflects "which way helps buying, right now" —
+  // not a fixed left-to-right convention.
+  const sliderDirections = useMemo(
+    () => computeSliderDirections(currentInputs, FIELD_RANGES, result.netWorthGap),
+    [
+      homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
+      propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
+      closingCostBuyPct, closingCostSellPct,
+      monthlyRent, rentGrowthPct, rentersInsuranceMonthly,
+      investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
+      yearsToStay, result.netWorthGap,
+    ]
+  );
 
   const buyWins = result.netWorthGap >= 0;
   const gapAbs = Math.abs(result.netWorthGap);
@@ -291,14 +328,20 @@ function RentVsBuyCalculator() {
       <div className="rvb-grid" style={{ display: "grid", gridTemplateColumns: "380px 1fr", gap: 0 }}>
         <div style={{ padding: "24px", borderRight: `1px solid ${GRID}`, background: PANEL }}>
           <div className="rvb-section-label">THE BASICS</div>
-          <GradientSlider label="Home price" value={homePrice} min={100000} max={2000000} step={5000} onChange={setHomePrice} prefix="$" />
-          <GradientSlider label="Down payment" value={downPaymentPct} min={0} max={100} step={1} onChange={setDownPaymentPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} />
-          <GradientSlider label="Mortgage rate" value={mortgageRatePct} min={0} max={12} step={0.125} onChange={setMortgageRatePct} suffix="%" />
-          <GradientSlider label="Monthly rent (equivalent home)" value={monthlyRent} min={500} max={10000} step={50} onChange={setMonthlyRent} prefix="$" />
-          <GradientSlider label="Years you'll stay" value={yearsToStay} min={1} max={40} step={1} onChange={setYearsToStay} suffix="yr" />
-          <GradientSlider label="Investment return, if renting" value={investmentReturnPct} min={0} max={15} step={0.25} onChange={setInvestmentReturnPct} suffix="%"
+          <div style={{ fontSize: "11px", color: MUTED, marginBottom: "16px", lineHeight: 1.6 }}>
+            Each slider's color shows which direction currently helps <span style={{ color: BUY }}>buying</span> vs.{" "}
+            <span style={{ color: RENT }}>renting</span>, given where every other slider sits right now — nudge one
+            and the others' colors can flip, since e.g. a bigger down payment only favors buying when it's not also
+            crowding out a better return renting could get from investing that cash instead.
+          </div>
+          <GradientSlider label="Home price" value={homePrice} min={FIELD_RANGES.homePrice.min} max={FIELD_RANGES.homePrice.max} step={5000} onChange={setHomePrice} prefix="$" reversed={sliderDirections.homePrice === "rent"} />
+          <GradientSlider label="Down payment" value={downPaymentPct} min={FIELD_RANGES.downPaymentPct.min} max={FIELD_RANGES.downPaymentPct.max} step={1} onChange={setDownPaymentPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} reversed={sliderDirections.downPaymentPct === "rent"} />
+          <GradientSlider label="Mortgage rate" value={mortgageRatePct} min={FIELD_RANGES.mortgageRatePct.min} max={FIELD_RANGES.mortgageRatePct.max} step={0.125} onChange={setMortgageRatePct} suffix="%" reversed={sliderDirections.mortgageRatePct === "rent"} />
+          <GradientSlider label="Monthly rent (equivalent home)" value={monthlyRent} min={FIELD_RANGES.monthlyRent.min} max={FIELD_RANGES.monthlyRent.max} step={50} onChange={setMonthlyRent} prefix="$" reversed={sliderDirections.monthlyRent === "rent"} />
+          <GradientSlider label="Years you'll stay" value={yearsToStay} min={FIELD_RANGES.yearsToStay.min} max={FIELD_RANGES.yearsToStay.max} step={1} onChange={setYearsToStay} suffix="yr" reversed={sliderDirections.yearsToStay === "rent"} />
+          <GradientSlider label="Investment return, if renting" value={investmentReturnPct} min={FIELD_RANGES.investmentReturnPct.min} max={FIELD_RANGES.investmentReturnPct.max} step={0.25} onChange={setInvestmentReturnPct} suffix="%" reversed={sliderDirections.investmentReturnPct === "rent"}
             helpText="What the money not spent on a down payment (and any month renting is cheaper) could earn invested instead." />
-          <GradientSlider label="Home price appreciation" value={homeAppreciationPct} min={-5} max={10} step={0.25} onChange={setHomeAppreciationPct} suffix="%" />
+          <GradientSlider label="Home price appreciation" value={homeAppreciationPct} min={FIELD_RANGES.homeAppreciationPct.min} max={FIELD_RANGES.homeAppreciationPct.max} step={0.25} onChange={setHomeAppreciationPct} suffix="%" reversed={sliderDirections.homeAppreciationPct === "rent"} />
 
           <div style={{ fontSize: "11px", color: MUTED, marginTop: "8px", marginBottom: "18px", lineHeight: 1.6 }}>
             Estimated mortgage payment: <strong style={{ color: PARCHMENT }}>{fmtMoney(previewPayment)}/mo</strong> (principal + interest only, {mortgageTermYears}-yr term)
@@ -312,17 +355,17 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.ownership && (
                 <>
-                  <GradientSlider label="Property tax" value={propertyTaxPct} min={0} max={4} step={0.05} onChange={setPropertyTaxPct} suffix="%/yr" />
+                  <GradientSlider label="Property tax" value={propertyTaxPct} min={FIELD_RANGES.propertyTaxPct.min} max={FIELD_RANGES.propertyTaxPct.max} step={0.05} onChange={setPropertyTaxPct} suffix="%/yr" reversed={sliderDirections.propertyTaxPct === "rent"} />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">Homeowners insurance ($/yr)</span>
                     <input type="number" value={homeInsuranceAnnual} onChange={(e) => setHomeInsuranceAnnual(e.target.value)} />
                   </div>
-                  <GradientSlider label="Maintenance" value={maintenancePct} min={0} max={4} step={0.05} onChange={setMaintenancePct} suffix="%/yr" />
+                  <GradientSlider label="Maintenance" value={maintenancePct} min={FIELD_RANGES.maintenancePct.min} max={FIELD_RANGES.maintenancePct.max} step={0.05} onChange={setMaintenancePct} suffix="%/yr" reversed={sliderDirections.maintenancePct === "rent"} />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">HOA dues ($/mo)</span>
                     <input type="number" value={hoaMonthly} onChange={(e) => setHoaMonthly(e.target.value)} />
                   </div>
-                  <GradientSlider label="PMI (while equity < 20%)" value={pmiPct} min={0} max={2} step={0.05} onChange={setPmiPct} suffix="%/yr" />
+                  <GradientSlider label="PMI (while equity < 20%)" value={pmiPct} min={FIELD_RANGES.pmiPct.min} max={FIELD_RANGES.pmiPct.max} step={0.05} onChange={setPmiPct} suffix="%/yr" reversed={sliderDirections.pmiPct === "rent"} />
                 </>
               )}
 
@@ -332,8 +375,8 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.transaction && (
                 <>
-                  <GradientSlider label="Closing costs, buying" value={closingCostBuyPct} min={0} max={8} step={0.25} onChange={setClosingCostBuyPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} />
-                  <GradientSlider label="Selling costs (agent fees, etc.)" value={closingCostSellPct} min={0} max={10} step={0.25} onChange={setClosingCostSellPct} suffix="%"
+                  <GradientSlider label="Closing costs, buying" value={closingCostBuyPct} min={FIELD_RANGES.closingCostBuyPct.min} max={FIELD_RANGES.closingCostBuyPct.max} step={0.25} onChange={setClosingCostBuyPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} reversed={sliderDirections.closingCostBuyPct === "rent"} />
+                  <GradientSlider label="Selling costs (agent fees, etc.)" value={closingCostSellPct} min={FIELD_RANGES.closingCostSellPct.min} max={FIELD_RANGES.closingCostSellPct.max} step={0.25} onChange={setClosingCostSellPct} suffix="%" reversed={sliderDirections.closingCostSellPct === "rent"}
                     helpText="Charged against the home's future sale price when computing net worth at the end of the horizon." />
                 </>
               )}
@@ -344,7 +387,7 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.rental && (
                 <>
-                  <GradientSlider label="Rent growth" value={rentGrowthPct} min={0} max={10} step={0.25} onChange={setRentGrowthPct} suffix="%/yr" />
+                  <GradientSlider label="Rent growth" value={rentGrowthPct} min={FIELD_RANGES.rentGrowthPct.min} max={FIELD_RANGES.rentGrowthPct.max} step={0.25} onChange={setRentGrowthPct} suffix="%/yr" reversed={sliderDirections.rentGrowthPct === "rent"} />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">Renters insurance ($/mo)</span>
                     <input type="number" value={rentersInsuranceMonthly} onChange={(e) => setRentersInsuranceMonthly(e.target.value)} />
@@ -363,7 +406,7 @@ function RentVsBuyCalculator() {
                   </button>
                   {itemizeDeductions && (
                     <>
-                      <GradientSlider label="Marginal tax rate" value={marginalTaxRatePct} min={0} max={50} step={1} onChange={setMarginalTaxRatePct} suffix="%" />
+                      <GradientSlider label="Marginal tax rate" value={marginalTaxRatePct} min={FIELD_RANGES.marginalTaxRatePct.min} max={FIELD_RANGES.marginalTaxRatePct.max} step={1} onChange={setMarginalTaxRatePct} suffix="%" reversed={sliderDirections.marginalTaxRatePct === "rent"} />
                       <div style={{ marginBottom: "14px" }}>
                         <span className="rvb-field-label">Standard deduction, for comparison ($/yr)</span>
                         <input type="number" value={standardDeductionAnnual} onChange={(e) => setStandardDeductionAnnual(e.target.value)} />

@@ -1,11 +1,14 @@
 // A range input paired with an editable number field, and a track rendered as discrete
 // color blocks (not a smooth blend) — a "boxy" thermal gradient (blue → violet → red) as a
-// visual cue for where the value sits between its min and max. The blockiness is a deliberate
-// style choice (distinct from a smooth CSS gradient), not a meaningful data encoding.
+// live indicator of which direction on THIS slider currently favors buying vs. renting, given
+// every other input's current value. `reversed` flips which end is which — the direction that
+// helps buying isn't fixed to "higher" or "lower" for every field (e.g. more down payment can
+// help buying or renting depending on the mortgage-rate/investment-return spread), so the
+// caller computes that per-render via a quick sensitivity check and tells us which way to draw it.
 const GRADIENT_STOPS = [
-  { pos: 0, rgb: [46, 107, 224] },   // cold blue
+  { pos: 0, rgb: [46, 107, 224] },   // cold blue — favors renting
   { pos: 0.5, rgb: [155, 79, 224] }, // violet
-  { pos: 1, rgb: [224, 71, 59] },    // hot red
+  { pos: 1, rgb: [224, 71, 59] },    // hot red — favors buying
 ];
 const SEGMENT_COUNT = 26;
 
@@ -26,12 +29,14 @@ function segmentColor(t) {
   return `rgb(${last[0]}, ${last[1]}, ${last[2]})`;
 }
 
-const SEGMENTS = Array.from({ length: SEGMENT_COUNT }, (_, i) => segmentColor(i / (SEGMENT_COUNT - 1)));
+const FORWARD_SEGMENTS = Array.from({ length: SEGMENT_COUNT }, (_, i) => segmentColor(i / (SEGMENT_COUNT - 1)));
+const REVERSED_SEGMENTS = [...FORWARD_SEGMENTS].reverse();
 
-export default function GradientSlider({ label, value, min, max, step = 1, onChange, prefix, suffix, derived, helpText }) {
+export default function GradientSlider({ label, value, min, max, step = 1, onChange, prefix, suffix, derived, helpText, reversed = false }) {
   const numeric = Number(value);
   const pct = max > min ? ((numeric - min) / (max - min)) * 100 : 0;
   const clampedPct = Math.min(Math.max(Number.isFinite(pct) ? pct : 0, 0), 100);
+  const segments = reversed ? REVERSED_SEGMENTS : FORWARD_SEGMENTS;
 
   return (
     <div className="rvb-slider-wrap">
@@ -42,7 +47,11 @@ export default function GradientSlider({ label, value, min, max, step = 1, onCha
           <input
             type="number"
             className="rvb-slider-number"
-            value={Number.isFinite(numeric) ? numeric : ""}
+            // Deliberately the raw `value` prop, not a Number()-coerced fallback — coercing
+            // an in-progress empty string back to 0 (Number("") === 0, which is finite) was
+            // exactly what made a cleared field snap back to "0" instead of staying blank
+            // while typing a replacement.
+            value={value}
             min={min}
             max={max}
             step={step}
@@ -54,7 +63,7 @@ export default function GradientSlider({ label, value, min, max, step = 1, onCha
       </div>
       <div className="rvb-slider-track-wrap">
         <div className="rvb-slider-track">
-          {SEGMENTS.map((color, i) => (
+          {segments.map((color, i) => (
             <div key={i} className="rvb-slider-segment" style={{ background: color }} />
           ))}
         </div>

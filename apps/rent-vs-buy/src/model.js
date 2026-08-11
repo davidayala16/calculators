@@ -176,3 +176,27 @@ export function simulateRentVsBuy(inputs) {
     firstMonthRentCost,
   };
 }
+
+// For each field in `fieldRanges`, nudges it upward by 5% of its slider range and re-runs the
+// simulation to see whether that increases or decreases the buy/rent net-worth gap — i.e.
+// whether *more* of that input currently helps buying or renting, given every other input's
+// present value. This isn't fixed per field: e.g. a bigger down payment can favor buying or
+// renting depending on the spread between the mortgage rate and the assumed investment return,
+// so it has to be recomputed against the live inputs rather than hardcoded once. Used purely to
+// orient each slider's gradient direction — "which way currently helps buying" — not to change
+// the math of the result itself.
+export function computeSliderDirections(inputs, fieldRanges, baseGap) {
+  const directions = {};
+  for (const [field, range] of Object.entries(fieldRanges)) {
+    const span = range.max - range.min;
+    const bump = span > 0 ? span * 0.05 : 1;
+    const current = Number(inputs[field]) || 0;
+    const nudgedGap = simulateRentVsBuy({ ...inputs, [field]: current + bump }).netWorthGap;
+    // Ties (nudgedGap === baseGap) default to "buy" — this only happens when the field is
+    // currently inert, e.g. PMI's rate has zero effect whenever equity is already >= 20% and
+    // never drops below it. Harmless: an inert field showing either color isn't factually
+    // wrong, since neither direction is actually true when the field doesn't affect anything.
+    directions[field] = nudgedGap >= baseGap ? "buy" : "rent";
+  }
+  return directions;
+}
