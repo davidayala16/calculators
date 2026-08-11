@@ -18,6 +18,7 @@ standalone Vite project, and deploys to its own path (e.g.
 ## Calculators
 
 - [`apps/retirement-runway/`](apps/retirement-runway/) — projects portfolio growth and retirement drawdown at a chosen withdrawal rate.
+- [`apps/rent-vs-buy/`](apps/rent-vs-buy/) — compares the long-run net worth of buying a home against renting and investing the difference, accounting for appreciation, rent growth, investment returns, and taxes.
 
 ## Development
 
