@@ -1755,13 +1755,13 @@ function RetirementRunwayV4() {
 
                   <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
                     <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
-                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 2 }}>Tier</span><span style={{ flex: 2, textAlign: "right" }}>Extra/mo</span>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 2, textAlign: "right" }}>Tier</span><span style={{ flex: 2, textAlign: "right" }}>Extra/mo</span>
                     </div>
                     {irmaaTable.map((r) => (
                       <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
                         <span style={{ flex: 1 }}>{r.age}</span>
                         <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magi)}</span>
-                        <span style={{ flex: 2, color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.tier.label}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.tier.label}</span>
                         <span style={{ flex: 2, textAlign: "right", color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.extraMonthly > 0 ? fmtMoney(r.extraMonthly) : "$0"}</span>
                       </div>
                     ))}
