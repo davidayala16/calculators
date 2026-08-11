@@ -8,7 +8,7 @@ import { test, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   BASE_URL, startPreviewServer, stopPreviewServer, launchBrowser,
-  expandEverything, collectErrors, isShowingErrorBoundary,
+  expandEverything, collectErrors, isShowingErrorBoundary, fieldByLabel,
 } from './helpers.mjs';
 
 const TEST_TIMEOUT_MS = 60_000;
@@ -112,7 +112,7 @@ test('autosaves to localStorage and restores after a genuine browser restart', {
   const page = await context.newPage();
   await page.goto(BASE_URL, { waitUntil: 'networkidle' });
 
-  const insuranceInput = page.locator('input[type="number"]').first();
+  const insuranceInput = fieldByLabel(page, 'Homeowners insurance');
   // this field is only mounted once "Advanced" + "Ownership Costs" are visible
   await page.click('text=Advanced');
   await page.waitForTimeout(150);
@@ -133,7 +133,7 @@ test('autosaves to localStorage and restores after a genuine browser restart', {
   await page2.goto(BASE_URL, { waitUntil: 'networkidle' });
   await page2.click('text=Advanced');
   await page2.waitForTimeout(150);
-  const restored = await page2.locator('input[type="number"]').first().inputValue();
+  const restored = await fieldByLabel(page2, 'Homeowners insurance').inputValue();
   assert.equal(restored, '2400');
   await context2.close();
   await browser.close();
@@ -147,7 +147,7 @@ test('an explicit shared link overrides the local autosave', { timeout: TEST_TIM
   await page.click('text=Advanced');
   await page.waitForTimeout(150);
 
-  const insuranceInput = page.locator('input[type="number"]').first();
+  const insuranceInput = fieldByLabel(page, 'Homeowners insurance');
   await insuranceInput.click({ clickCount: 3 });
   await insuranceInput.fill('');
   await insuranceInput.type('3000', { delay: 15 });
@@ -165,7 +165,7 @@ test('an explicit shared link overrides the local autosave', { timeout: TEST_TIM
   await page.goto(shareUrl, { waitUntil: 'networkidle' });
   await page.click('text=Advanced');
   await page.waitForTimeout(150);
-  const fromLink = await page.locator('input[type="number"]').first().inputValue();
+  const fromLink = await fieldByLabel(page, 'Homeowners insurance').inputValue();
   assert.equal(fromLink, '3000', 'the link (3000) should win over the newer local save (999)');
 
   await context.close();
@@ -180,7 +180,7 @@ test('"Start fresh" resets the autosave back to defaults', { timeout: TEST_TIMEO
   await page.click('text=Advanced');
   await page.waitForTimeout(150);
 
-  const insuranceInput = page.locator('input[type="number"]').first();
+  const insuranceInput = fieldByLabel(page, 'Homeowners insurance');
   await insuranceInput.click({ clickCount: 3 });
   await insuranceInput.fill('');
   await insuranceInput.type('5000', { delay: 15 });
@@ -193,7 +193,7 @@ test('"Start fresh" resets the autosave back to defaults', { timeout: TEST_TIMEO
   await page.reload({ waitUntil: 'networkidle' });
   await page.click('text=Advanced');
   await page.waitForTimeout(150);
-  const value = await page.locator('input[type="number"]').first().inputValue();
+  const value = await fieldByLabel(page, 'Homeowners insurance').inputValue();
   assert.equal(value, '1800', 'insurance should be back to its default after Start fresh + reload');
 
   await context.close();

@@ -84,3 +84,10 @@ export async function isShowingErrorBoundary(page) {
   const text = await page.locator('body').innerText().catch(() => 'READ_FAILED');
   return text.includes('Something went wrong') || text === 'READ_FAILED';
 }
+
+// Locates a plain (non-slider) number field by its label text rather than DOM-order index —
+// every slider also renders its own <input type="number">, so ".first()" is fragile and
+// silently targets the wrong field whenever a slider is added/reordered above it.
+export function fieldByLabel(page, labelText) {
+  return page.locator(`span.rvb-field-label:has-text("${labelText}")`).locator('xpath=following-sibling::input');
+}

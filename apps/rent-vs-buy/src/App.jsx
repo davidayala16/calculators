@@ -221,12 +221,21 @@ function RentVsBuyCalculator() {
         .rvb-caret { font-size: 10px; transition: transform 0.15s ease; }
         .rvb-row { display: flex; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid ${GRID}; align-items: center; }
         .rvb-row:last-child { border-bottom: none; }
-        .rvb-slider-wrap { margin-bottom: 20px; }
-        .rvb-slider-header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 8px; }
-        .rvb-slider-value { font-size: 13px; color: ${PARCHMENT}; font-weight: 600; }
-        .rvb-slider-track { position: relative; height: 8px; border-radius: 4px; background: linear-gradient(90deg, #2E6BE0 0%, #9B4FE0 50%, #E0473B 100%); }
-        .rvb-slider-fill-marker { position: absolute; top: 50%; width: 16px; height: 16px; border-radius: 50%; background: ${PANEL_2}; border: 3px solid ${PARCHMENT}; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 1px 4px rgba(0,0,0,0.5); }
-        .rvb-slider-input { position: absolute; top: -8px; left: 0; width: 100%; height: 24px; margin: 0; opacity: 0; cursor: pointer; }
+        .rvb-slider-wrap { margin-bottom: 22px; }
+        .rvb-slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px; }
+        .rvb-slider-input-group { display: flex; align-items: center; gap: 4px; }
+        .rvb-slider-number {
+          width: 92px; text-align: right; background: ${PANEL_2}; border: 1px solid ${GRID}; color: ${PARCHMENT};
+          border-radius: 3px; padding: 5px 7px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600;
+        }
+        .rvb-slider-number:focus { outline: none; border-color: ${BUY}; }
+        .rvb-slider-adornment { font-size: 13px; color: ${MUTED}; font-weight: 600; }
+        .rvb-slider-derived { font-size: 11px; color: ${MUTED}; margin-left: 4px; }
+        .rvb-slider-track-wrap { position: relative; height: 20px; display: flex; align-items: center; }
+        .rvb-slider-track { display: flex; gap: 2px; width: 100%; height: 10px; }
+        .rvb-slider-segment { flex: 1; border-radius: 1px; }
+        .rvb-slider-fill-marker { position: absolute; top: 50%; width: 4px; height: 22px; border-radius: 2px; background: ${PARCHMENT}; transform: translate(-50%, -50%); pointer-events: none; box-shadow: 0 1px 4px rgba(0,0,0,0.6); }
+        .rvb-slider-input { position: absolute; top: -6px; left: 0; width: 100%; height: 32px; margin: 0; opacity: 0; cursor: pointer; }
         .rvb-slider-help { font-size: 11px; color: ${MUTED}; margin-top: 6px; line-height: 1.5; }
         @media (max-width: 780px) { .rvb-grid { grid-template-columns: 1fr !important; } }
       `}</style>
@@ -282,14 +291,14 @@ function RentVsBuyCalculator() {
       <div className="rvb-grid" style={{ display: "grid", gridTemplateColumns: "380px 1fr", gap: 0 }}>
         <div style={{ padding: "24px", borderRight: `1px solid ${GRID}`, background: PANEL }}>
           <div className="rvb-section-label">THE BASICS</div>
-          <GradientSlider label="Home price" value={homePrice} min={100000} max={2000000} step={5000} onChange={setHomePrice} formatValue={(v) => fmtMoney(v, true)} />
-          <GradientSlider label="Down payment" value={downPaymentPct} min={0} max={100} step={1} onChange={setDownPaymentPct} formatValue={(v) => `${v}%  (${fmtMoney(homePrice * (v / 100), true)})`} />
-          <GradientSlider label="Mortgage rate" value={mortgageRatePct} min={0} max={12} step={0.125} onChange={setMortgageRatePct} formatValue={fmtPct} />
-          <GradientSlider label="Monthly rent (equivalent home)" value={monthlyRent} min={500} max={10000} step={50} onChange={setMonthlyRent} formatValue={(v) => fmtMoney(v)} />
-          <GradientSlider label="Years you'll stay" value={yearsToStay} min={1} max={40} step={1} onChange={setYearsToStay} formatValue={(v) => `${v} yr`} />
-          <GradientSlider label="Investment return, if renting" value={investmentReturnPct} min={0} max={15} step={0.25} onChange={setInvestmentReturnPct} formatValue={fmtPct}
+          <GradientSlider label="Home price" value={homePrice} min={100000} max={2000000} step={5000} onChange={setHomePrice} prefix="$" />
+          <GradientSlider label="Down payment" value={downPaymentPct} min={0} max={100} step={1} onChange={setDownPaymentPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} />
+          <GradientSlider label="Mortgage rate" value={mortgageRatePct} min={0} max={12} step={0.125} onChange={setMortgageRatePct} suffix="%" />
+          <GradientSlider label="Monthly rent (equivalent home)" value={monthlyRent} min={500} max={10000} step={50} onChange={setMonthlyRent} prefix="$" />
+          <GradientSlider label="Years you'll stay" value={yearsToStay} min={1} max={40} step={1} onChange={setYearsToStay} suffix="yr" />
+          <GradientSlider label="Investment return, if renting" value={investmentReturnPct} min={0} max={15} step={0.25} onChange={setInvestmentReturnPct} suffix="%"
             helpText="What the money not spent on a down payment (and any month renting is cheaper) could earn invested instead." />
-          <GradientSlider label="Home price appreciation" value={homeAppreciationPct} min={-5} max={10} step={0.25} onChange={setHomeAppreciationPct} formatValue={fmtPct} />
+          <GradientSlider label="Home price appreciation" value={homeAppreciationPct} min={-5} max={10} step={0.25} onChange={setHomeAppreciationPct} suffix="%" />
 
           <div style={{ fontSize: "11px", color: MUTED, marginTop: "8px", marginBottom: "18px", lineHeight: 1.6 }}>
             Estimated mortgage payment: <strong style={{ color: PARCHMENT }}>{fmtMoney(previewPayment)}/mo</strong> (principal + interest only, {mortgageTermYears}-yr term)
@@ -303,17 +312,17 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.ownership && (
                 <>
-                  <GradientSlider label="Property tax" value={propertyTaxPct} min={0} max={4} step={0.05} onChange={setPropertyTaxPct} formatValue={(v) => `${fmtPct(v)}/yr`} />
+                  <GradientSlider label="Property tax" value={propertyTaxPct} min={0} max={4} step={0.05} onChange={setPropertyTaxPct} suffix="%/yr" />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">Homeowners insurance ($/yr)</span>
                     <input type="number" value={homeInsuranceAnnual} onChange={(e) => setHomeInsuranceAnnual(e.target.value)} />
                   </div>
-                  <GradientSlider label="Maintenance" value={maintenancePct} min={0} max={4} step={0.05} onChange={setMaintenancePct} formatValue={(v) => `${fmtPct(v)}/yr`} />
+                  <GradientSlider label="Maintenance" value={maintenancePct} min={0} max={4} step={0.05} onChange={setMaintenancePct} suffix="%/yr" />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">HOA dues ($/mo)</span>
                     <input type="number" value={hoaMonthly} onChange={(e) => setHoaMonthly(e.target.value)} />
                   </div>
-                  <GradientSlider label="PMI (while equity < 20%)" value={pmiPct} min={0} max={2} step={0.05} onChange={setPmiPct} formatValue={(v) => `${fmtPct(v)}/yr`} />
+                  <GradientSlider label="PMI (while equity < 20%)" value={pmiPct} min={0} max={2} step={0.05} onChange={setPmiPct} suffix="%/yr" />
                 </>
               )}
 
@@ -323,8 +332,8 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.transaction && (
                 <>
-                  <GradientSlider label="Closing costs, buying" value={closingCostBuyPct} min={0} max={8} step={0.25} onChange={setClosingCostBuyPct} formatValue={(v) => `${fmtPct(v)} (${fmtMoney(homePrice * (v / 100), true)})`} />
-                  <GradientSlider label="Selling costs (agent fees, etc.)" value={closingCostSellPct} min={0} max={10} step={0.25} onChange={setClosingCostSellPct} formatValue={fmtPct}
+                  <GradientSlider label="Closing costs, buying" value={closingCostBuyPct} min={0} max={8} step={0.25} onChange={setClosingCostBuyPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} />
+                  <GradientSlider label="Selling costs (agent fees, etc.)" value={closingCostSellPct} min={0} max={10} step={0.25} onChange={setClosingCostSellPct} suffix="%"
                     helpText="Charged against the home's future sale price when computing net worth at the end of the horizon." />
                 </>
               )}
@@ -335,7 +344,7 @@ function RentVsBuyCalculator() {
               </button>
               {expanded.rental && (
                 <>
-                  <GradientSlider label="Rent growth" value={rentGrowthPct} min={0} max={10} step={0.25} onChange={setRentGrowthPct} formatValue={(v) => `${fmtPct(v)}/yr`} />
+                  <GradientSlider label="Rent growth" value={rentGrowthPct} min={0} max={10} step={0.25} onChange={setRentGrowthPct} suffix="%/yr" />
                   <div style={{ marginBottom: "14px" }}>
                     <span className="rvb-field-label">Renters insurance ($/mo)</span>
                     <input type="number" value={rentersInsuranceMonthly} onChange={(e) => setRentersInsuranceMonthly(e.target.value)} />
@@ -354,7 +363,7 @@ function RentVsBuyCalculator() {
                   </button>
                   {itemizeDeductions && (
                     <>
-                      <GradientSlider label="Marginal tax rate" value={marginalTaxRatePct} min={0} max={50} step={1} onChange={setMarginalTaxRatePct} formatValue={fmtPct} />
+                      <GradientSlider label="Marginal tax rate" value={marginalTaxRatePct} min={0} max={50} step={1} onChange={setMarginalTaxRatePct} suffix="%" />
                       <div style={{ marginBottom: "14px" }}>
                         <span className="rvb-field-label">Standard deduction, for comparison ($/yr)</span>
                         <input type="number" value={standardDeductionAnnual} onChange={(e) => setStandardDeductionAnnual(e.target.value)} />
