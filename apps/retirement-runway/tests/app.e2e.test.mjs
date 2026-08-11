@@ -24,6 +24,11 @@ import {
 // launch per test costs a little time but has proven far more reliable in practice, and the
 // per-test `timeout` option below is a hard backstop either way.
 const TEST_TIMEOUT_MS = 60_000;
+// The numeric-input sweep scales with how many optional sections/inputs this calculator has grown
+// to (it fills every input with 3 extreme values, one at a time) — a fixed 60s budget kept getting
+// tighter as sections were added and finally tipped over into a timeout with no crash involved.
+// Give it its own, larger budget instead of raising the ceiling for every other test too.
+const SWEEP_TIMEOUT_MS = 150_000;
 
 let previewProc;
 
@@ -35,7 +40,7 @@ after(() => {
   stopPreviewServer(previewProc);
 });
 
-test('sweeps every numeric input with extreme values without crashing or hanging', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+test('sweeps every numeric input with extreme values without crashing or hanging', { timeout: SWEEP_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();
   const page = await context.newPage();

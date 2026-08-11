@@ -60,9 +60,9 @@ export async function expandEverything(page) {
 
   const collapsedByDefaultHeaders = [
     'SOCIAL SECURITY (OPTIONAL)', 'AFTER-TAX WITHDRAWALS', 'ROTH CONVERSION LADDER', 'ACA SUBSIDY CLIFF',
-    'REQUIRED MINIMUM DISTRIBUTIONS', 'MEDICARE IRMAA', 'NIIT —', 'SPENDING GLIDE PATH',
-    'EARLY RETIREMENT', 'MARKET VOLATILITY', 'WITHDRAWAL ORDER', 'CONTRIBUTION LIMIT CHECK',
-    'ANNUAL BUDGET', 'TAX STRATEGY',
+    'REQUIRED MINIMUM DISTRIBUTIONS', 'MEDICARE IRMAA', 'NIIT —', 'LONG-TERM CARE',
+    'SPENDING GLIDE PATH', 'EARLY RETIREMENT', 'MARKET VOLATILITY', 'WITHDRAWAL ORDER',
+    'CONTRIBUTION LIMIT CHECK', 'ANNUAL BUDGET', 'TAX STRATEGY',
   ];
   for (const h of collapsedByDefaultHeaders) {
     const btn = page.locator(`button.rr-collapsible-header:has-text("${h}")`).first();
@@ -72,12 +72,28 @@ export async function expandEverything(page) {
     }
   }
 
+  // The Widow(er)/Survivor Tax Torpedo section only renders at all when filing status is "joint"
+  // (default is "single") — its toggle button lives inside the now-expanded IRMAA section above.
+  // Switch to joint first so the section (and its header) actually exist before trying to open it.
+  const jointToggle = page.locator('button:has-text("Married, joint")').first();
+  if (await jointToggle.count()) {
+    await jointToggle.click();
+    await page.waitForTimeout(150);
+  }
+  const widowHeader = page.locator('button.rr-collapsible-header:has-text("WIDOW(ER)")').first();
+  if (await widowHeader.count()) {
+    await widowHeader.click();
+    await page.waitForTimeout(80);
+  }
+
   const subRevealToggles = [
     'tap to add a slowdown',
     'tap to cap it',
     'tap to test stopping early',
     'Not included — tap to add',
     'Not estimated — tap to add',
+    'Not modeled — tap to add',
+    'Not stress-tested — tap to add',
   ];
   // Several sections (IRMAA/RMD/NIIT/ACA) share identical toggle copy, so more than one button can
   // match a given label — loop until none remain instead of clicking only the first.

@@ -277,6 +277,71 @@ function acaApplicablePct(fplPct) {
   return null; // over 400% FPL: the cliff — zero subsidy, full premium
 }
 
+// QCD (Qualified Charitable Distribution): sends Traditional IRA money straight to charity,
+// excluded from taxable income and MAGI entirely, and counts toward satisfying that year's RMD.
+// Eligibility starts at 70½ — notably NOT the same as the RMD start age above; SECURE 2.0 moved
+// the RMD start age to 73 but left the QCD eligibility age at 70½, so there's a real multi-year
+// window where QCDs are available before RMDs even begin. 2026 limit, indexed for inflation.
+const QCD_ELIGIBLE_AGE = 70.5;
+const QCD_ANNUAL_LIMIT_2026 = 111000;
+
+// 2026 federal long-term capital gains brackets. Gains "stack" on top of ordinary taxable income
+// to determine which rate applies — the same amount of gains can be entirely tax-free for someone
+// with low ordinary income, or partly taxed at 20% for someone with high ordinary income, even at
+// an identical gains dollar amount. This is why a flat capital-gains-rate input (the default
+// elsewhere in this tool) can meaningfully over- or under-state the real tax.
+const LTCG_BRACKETS_2026 = {
+  single: [{ max: 49450, rate: 0 }, { max: 545500, rate: 0.15 }, { max: Infinity, rate: 0.2 }],
+  joint: [{ max: 98900, rate: 0 }, { max: 613700, rate: 0.15 }, { max: Infinity, rate: 0.2 }],
+};
+function stackedCapGainsTax(ordinaryIncome, gains, filingStatus) {
+  const brackets = LTCG_BRACKETS_2026[filingStatus] || LTCG_BRACKETS_2026.single;
+  const gainsStart = Math.max(ordinaryIncome, 0);
+  const gainsEnd = gainsStart + Math.max(gains, 0);
+  let tax = 0;
+  let prevMax = 0;
+  for (const b of brackets) {
+    const overlapStart = Math.max(prevMax, gainsStart);
+    const overlapEnd = Math.min(b.max, gainsEnd);
+    if (overlapEnd > overlapStart) tax += (overlapEnd - overlapStart) * b.rate;
+    prevMax = b.max;
+  }
+  return tax;
+}
+
+// Long-term care: the biggest unmodeled tail risk in most retirement plans. CareScout/Genworth's
+// 2025 Cost of Care Survey (released March 2026) — national medians, self-funded scenario adds this
+// as an extra withdrawal on top of normal spending for a chosen window; the insured scenario instead
+// adds a smaller premium across every retirement year and assumes the policy covers the event itself.
+const LTC_CARE_TYPES = [
+  { key: "homeHealth", label: "Home health aide", annualCost: 80080 },
+  { key: "assistedLiving", label: "Assisted living", annualCost: 74400 },
+  { key: "nursingSemiPrivate", label: "Nursing home (semi-private)", annualCost: 114975 },
+  { key: "nursingPrivate", label: "Nursing home (private room)", annualCost: 129575 },
+];
+
+// monthly compounding, mirrors simulateDrawdown but adds a flat extra annual expense during a
+// chosen age window (self-funded LTC) and/or a flat annual premium across every year (insurance) —
+// kept as a separate function rather than bolting more parameters onto simulateDrawdown, since this
+// models a fundamentally different scenario (a stress test / comparison), not the baseline plan.
+function simulateDrawdownWithExtra({ portfolioAtRetirement, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile, extraStartAge, extraEndAge, extraAnnual, premiumAnnual }) {
+  const monthlyRate = realPostReturn / 100 / 12;
+  let val = portfolioAtRetirement;
+  const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
+  const lastAge = retireAge + span;
+  for (let age = retireAge; age <= lastAge; age++) {
+    const smile = useSmile ? spendingSmileFactor(age) : 1;
+    const inWindow = extraStartAge !== null && age >= extraStartAge && age < extraEndAge;
+    const extra = (inWindow ? extraAnnual : 0) + (premiumAnnual || 0);
+    const monthlyWithdrawal = (val * (withdrawalRate / 100) * smile + extra) / 12;
+    for (let m = 0; m < 12; m++) {
+      val = Math.min(val * (1 + monthlyRate) - monthlyWithdrawal, MAX_BALANCE);
+      if (val < 0) val = 0;
+    }
+  }
+  return val;
+}
+
 function RetirementRunwayV4() {
   const [currentAge, setCurrentAge] = useState(30);
   const [uiMode, setUiMode] = useState("basic"); // "basic" | "advanced"
@@ -332,6 +397,18 @@ function RetirementRunwayV4() {
   const [includeAca, setIncludeAca] = useState(false);
   const [acaHouseholdSize, setAcaHouseholdSize] = useState(1);
   const [acaAnnualPremium, setAcaAnnualPremium] = useState(12000);
+  const [qcdAnnualAmount, setQcdAnnualAmount] = useState(0);
+  const [includeLtc, setIncludeLtc] = useState(false);
+  const [ltcOnsetAge, setLtcOnsetAge] = useState(82);
+  const [ltcDurationYears, setLtcDurationYears] = useState(2);
+  const [ltcCareType, setLtcCareType] = useState("assistedLiving");
+  const [ltcAnnualCost, setLtcAnnualCost] = useState(74400);
+  const [ltcInsurancePremium, setLtcInsurancePremium] = useState(0);
+  const [includeWidowTorpedo, setIncludeWidowTorpedo] = useState(false);
+  const [survivorEventAge, setSurvivorEventAge] = useState(80);
+  const [survivorSsReductionPct, setSurvivorSsReductionPct] = useState(33);
+  const [healthcareInflation, setHealthcareInflation] = useState(6);
+  const [capGainsMode, setCapGainsMode] = useState("flat"); // "flat" | "bracket"
 
   // Persistence: fully self-contained, no account or backend calls of any kind. Two layers:
   // a debounced localStorage autosave (this browser only, survives refresh/crash, no action
@@ -390,6 +467,18 @@ function RetirementRunwayV4() {
     if (p.includeAca !== undefined) setIncludeAca(p.includeAca);
     if (p.acaHouseholdSize !== undefined) setAcaHouseholdSize(p.acaHouseholdSize);
     if (p.acaAnnualPremium !== undefined) setAcaAnnualPremium(p.acaAnnualPremium);
+    if (p.qcdAnnualAmount !== undefined) setQcdAnnualAmount(p.qcdAnnualAmount);
+    if (p.includeLtc !== undefined) setIncludeLtc(p.includeLtc);
+    if (p.ltcOnsetAge !== undefined) setLtcOnsetAge(p.ltcOnsetAge);
+    if (p.ltcDurationYears !== undefined) setLtcDurationYears(p.ltcDurationYears);
+    if (p.ltcCareType !== undefined) setLtcCareType(p.ltcCareType);
+    if (p.ltcAnnualCost !== undefined) setLtcAnnualCost(p.ltcAnnualCost);
+    if (p.ltcInsurancePremium !== undefined) setLtcInsurancePremium(p.ltcInsurancePremium);
+    if (p.includeWidowTorpedo !== undefined) setIncludeWidowTorpedo(p.includeWidowTorpedo);
+    if (p.survivorEventAge !== undefined) setSurvivorEventAge(p.survivorEventAge);
+    if (p.survivorSsReductionPct !== undefined) setSurvivorSsReductionPct(p.survivorSsReductionPct);
+    if (p.healthcareInflation !== undefined) setHealthcareInflation(p.healthcareInflation);
+    if (p.capGainsMode !== undefined) setCapGainsMode(p.capGainsMode);
   };
 
   const encodeProfile = (obj) => {
@@ -452,6 +541,8 @@ function RetirementRunwayV4() {
     taxableGainsFraction, stateTaxRate, ssTaxablePct,
     includeIrmaa, taxFilingStatus, irmaaPeopleOnMedicare,
     includeRmd, includeNiit, includeAca, acaHouseholdSize, acaAnnualPremium,
+    qcdAnnualAmount, includeLtc, ltcOnsetAge, ltcDurationYears, ltcCareType, ltcAnnualCost, ltcInsurancePremium,
+    includeWidowTorpedo, survivorEventAge, survivorSsReductionPct, healthcareInflation, capGainsMode,
   };
 
   // Autosave to localStorage, debounced so rapid typing doesn't hit disk on every keystroke.
@@ -486,6 +577,21 @@ function RetirementRunwayV4() {
   const expenseMonthlyBase = expenses.reduce((s, e) => s + Number(e.monthly || 0), 0);
   const expensePre65 = (expenseMonthlyBase + Number(healthcarePre65)) * 12;
   const expensePost65 = (expenseMonthlyBase + Number(healthcarePost65)) * 12;
+
+  // Healthcare costs have historically inflated faster than general CPI (default 6% vs. the 3%
+  // general default) — this is an informational comparison only, not wired into the target/gap
+  // math above, same non-circular pattern as the other optional sections.
+  const healthcareInflationComparison = useMemo(() => {
+    const baseAnnual = (Number(healthcarePre65) + Number(healthcarePost65)) * 12;
+    const horizonYears = Math.min(Math.max(Number(horizonAge) - Number(currentAge), 0), MAX_YEARS);
+    return [10, 20, 30]
+      .filter((y) => y <= horizonYears)
+      .map((y) => ({
+        years: y,
+        atGeneral: Math.min(baseAnnual * Math.pow(1 + Number(inflation) / 100, y), MAX_BALANCE),
+        atHealthcare: Math.min(baseAnnual * Math.pow(1 + Number(healthcareInflation) / 100, y), MAX_BALANCE),
+      }));
+  }, [healthcarePre65, healthcarePost65, inflation, healthcareInflation, horizonAge, currentAge]);
 
   const careerParams = {
     matureRaisePct: useRaiseSlowdown ? Number(matureRaisePct) : null,
@@ -661,19 +767,31 @@ function RetirementRunwayV4() {
     const taxableAmt = gross * accountMix.taxable;
 
     const ordinaryRate = Number(retirementMarginalRate) / 100 + Number(stateTaxRate) / 100;
-    const capGainsCombined = Number(capGainsRate) / 100 + Number(stateTaxRate) / 100;
+    const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
 
     const traditionalTax = traditionalAmt * ordinaryRate;
-    const taxableTax = taxableAmt * (Number(taxableGainsFraction) / 100) * capGainsCombined;
     const ssGross = includeSS ? ssMonthly * 12 : 0;
     const ssTax = ssGross * (Number(ssTaxablePct) / 100) * ordinaryRate;
+
+    // "Auto (2026 brackets)" mode stacks gains on top of ordinary taxable income to find the real
+    // 0%/15%/20% federal rate, instead of applying one flat rate to every dollar of gains — a flat
+    // rate over- or under-states the tax depending on how much ordinary income you also have that year.
+    let taxableTax;
+    if (capGainsMode === "bracket") {
+      const ordinaryForStacking = traditionalAmt + ssGross * (Number(ssTaxablePct) / 100);
+      const federalCapGainsTax = stackedCapGainsTax(ordinaryForStacking, capGainsAmt, taxFilingStatus);
+      taxableTax = federalCapGainsTax + capGainsAmt * (Number(stateTaxRate) / 100);
+    } else {
+      const capGainsCombined = Number(capGainsRate) / 100 + Number(stateTaxRate) / 100;
+      taxableTax = capGainsAmt * capGainsCombined;
+    }
 
     const totalTax = traditionalTax + taxableTax + ssTax;
     const totalGrossWithSS = gross + ssGross;
     const netAfterTax = totalGrossWithSS - totalTax;
 
     return { rothAmt, traditionalAmt, hsaAmt, taxableAmt, traditionalTax, taxableTax, ssGross, ssTax, totalTax, totalGrossWithSS, netAfterTax };
-  }, [withdrawalAtRetirement, accountMix, retirementMarginalRate, stateTaxRate, capGainsRate, taxableGainsFraction, includeSS, ssMonthly, ssTaxablePct]);
+  }, [withdrawalAtRetirement, accountMix, retirementMarginalRate, stateTaxRate, capGainsRate, taxableGainsFraction, includeSS, ssMonthly, ssTaxablePct, capGainsMode, taxFilingStatus]);
 
   // Medicare IRMAA: sampled every 5 years from the first Medicare-eligible age (65, or later if
   // retiring after 65), same age-grid convention as the withdrawal table above. MAGI here reuses
@@ -687,7 +805,9 @@ function RetirementRunwayV4() {
       .map((r) => {
         const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
         const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
-        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const rawTraditionalAmt = annualWithdrawal * accountMix.traditional;
+        const qcd = r.age >= QCD_ELIGIBLE_AGE ? Math.min(Number(qcdAnnualAmount), rawTraditionalAmt) : 0;
+        const traditionalAmt = rawTraditionalAmt - qcd;
         const taxableAmt = annualWithdrawal * accountMix.taxable;
         const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
         const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
@@ -696,7 +816,7 @@ function RetirementRunwayV4() {
         const extraMonthly = (tier.partBExtra + tier.partDExtra) * Number(irmaaPeopleOnMedicare);
         return { age: r.age, magi, tier, extraMonthly };
       });
-  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, irmaaPeopleOnMedicare]);
+  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, irmaaPeopleOnMedicare, qcdAnnualAmount]);
 
   // Required Minimum Distributions: sampled every 5 years from age 73 on (same grid convention as
   // the IRMAA table above). "Traditional balance" and "planned Traditional withdrawal" are both the
@@ -711,11 +831,17 @@ function RetirementRunwayV4() {
         const traditionalBalance = r.balance * accountMix.traditional;
         const requiredRmd = traditionalBalance / rmdDivisor(r.age);
         const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
-        const plannedTraditionalWithdrawal = annualWithdrawal * accountMix.traditional;
-        const shortfall = Math.max(requiredRmd - plannedTraditionalWithdrawal, 0);
-        return { age: r.age, traditionalBalance, requiredRmd, plannedTraditionalWithdrawal, shortfall };
+        const rawPlannedTraditional = annualWithdrawal * accountMix.traditional;
+        // QCD counts toward satisfying the RMD requirement even though it's excluded from taxable
+        // income — capped separately at what's actually being withdrawn (can't direct more to
+        // charity than the Traditional bucket is paying out) and at the RMD requirement itself.
+        const qcd = r.age >= QCD_ELIGIBLE_AGE ? Math.min(Number(qcdAnnualAmount), rawPlannedTraditional) : 0;
+        const plannedTraditionalWithdrawal = rawPlannedTraditional - qcd;
+        const rmdSatisfiedByQcd = Math.min(qcd, requiredRmd);
+        const shortfall = Math.max(requiredRmd - rmdSatisfiedByQcd - plannedTraditionalWithdrawal, 0);
+        return { age: r.age, traditionalBalance, requiredRmd, qcd, plannedTraditionalWithdrawal, shortfall };
       });
-  }, [includeRmd, draw.rows, retireAge, accountMix, withdrawalRate, useSpendingSmile]);
+  }, [includeRmd, draw.rows, retireAge, accountMix, withdrawalRate, useSpendingSmile, qcdAnnualAmount]);
 
   // NIIT: unlike IRMAA/RMD this isn't age-gated — it applies any year MAGI clears the threshold.
   // Sampled every 5 years from retirement on, same table style as the rest of this section.
@@ -727,7 +853,9 @@ function RetirementRunwayV4() {
       .map((r) => {
         const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
         const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
-        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const rawTraditionalAmt = annualWithdrawal * accountMix.traditional;
+        const qcd = r.age >= QCD_ELIGIBLE_AGE ? Math.min(Number(qcdAnnualAmount), rawTraditionalAmt) : 0;
+        const traditionalAmt = rawTraditionalAmt - qcd;
         const taxableAmt = annualWithdrawal * accountMix.taxable;
         const nii = taxableAmt * (Number(taxableGainsFraction) / 100); // net investment income ≈ the gains portion of taxable withdrawals
         const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
@@ -736,7 +864,7 @@ function RetirementRunwayV4() {
         const niitOwed = NIIT_RATE * Math.max(Math.min(nii, magi - threshold), 0);
         return { age: r.age, magi, nii, niitOwed };
       });
-  }, [includeNiit, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus]);
+  }, [includeNiit, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, qcdAnnualAmount]);
 
   // ACA subsidy cliff: only the pre-Medicare gap years matter here (retirement age through 64).
   // Requires a user-supplied premium estimate since this tool has no geographic/age-rated plan
@@ -795,6 +923,56 @@ function RetirementRunwayV4() {
     }
     return rungs;
   }, [retireAge, currentAge, expensePre65, inflation, retirementMarginalRate, stateTaxRate]);
+
+  // Long-term care: compares three drawdown paths against the same baseline plan — no LTC event,
+  // a self-funded event (extra withdrawal only during the care window), and an insured event (a
+  // smaller premium spread across every retirement year instead). All three reuse the portfolio
+  // already projected at retirement; this is a stress test, not a change to the core plan.
+  const ltcComparison = useMemo(() => {
+    if (!includeLtc) return null;
+    const common = {
+      portfolioAtRetirement: schedule.finalBalance, retireAge: Number(retireAge), horizonAge: Number(horizonAge),
+      realPostReturn, withdrawalRate: Number(withdrawalRate), useSmile: useSpendingSmile,
+    };
+    const onsetAge = Number(ltcOnsetAge);
+    const duration = Math.max(Number(ltcDurationYears), 0);
+    const withoutLtc = simulateDrawdownWithExtra({ ...common, extraStartAge: null, extraEndAge: null, extraAnnual: 0, premiumAnnual: 0 });
+    const selfFunded = simulateDrawdownWithExtra({ ...common, extraStartAge: onsetAge, extraEndAge: onsetAge + duration, extraAnnual: Number(ltcAnnualCost), premiumAnnual: 0 });
+    const insured = simulateDrawdownWithExtra({ ...common, extraStartAge: null, extraEndAge: null, extraAnnual: 0, premiumAnnual: Number(ltcInsurancePremium) });
+    return { withoutLtc, selfFunded, insured, selfFundedImpact: withoutLtc - selfFunded, insuredImpact: withoutLtc - insured };
+  }, [includeLtc, schedule.finalBalance, retireAge, horizonAge, realPostReturn, withdrawalRate, useSpendingSmile, ltcOnsetAge, ltcDurationYears, ltcAnnualCost, ltcInsurancePremium]);
+
+  // Widow(er)/survivor "tax torpedo": at a chosen "first death" age, filing status flips from joint
+  // to single (halving the IRMAA threshold) while income typically doesn't halve — Social Security
+  // drops to the higher of the two benefits (approximated here as a flat % reduction, since this
+  // tool only tracks one person's SS estimate, not two), and RMDs/withdrawals continue unchanged.
+  // Compares the hypothetical "both still alive, filing jointly" IRMAA tier against the same year's
+  // actual "survivor, filing single" tier to isolate the pure effect of the filing-status flip.
+  const widowTorpedoTable = useMemo(() => {
+    if (!includeWidowTorpedo) return [];
+    const firstAge = Number(survivorEventAge);
+    return draw.rows
+      .filter((r) => r.age >= firstAge && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const ssAnnualJoint = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
+        const ssAnnualSurvivor = ssAnnualJoint * (1 - Number(survivorSsReductionPct) / 100);
+        const rawTraditionalAmt = annualWithdrawal * accountMix.traditional;
+        const qcd = r.age >= QCD_ELIGIBLE_AGE ? Math.min(Number(qcdAnnualAmount), rawTraditionalAmt) : 0;
+        const traditionalAmt = rawTraditionalAmt - qcd;
+        const taxableAmt = annualWithdrawal * accountMix.taxable;
+        const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
+
+        const magiIfBothAlive = Math.max(traditionalAmt + capGainsAmt + ssAnnualJoint * (Number(ssTaxablePct) / 100), 0);
+        const magiAsSurvivor = Math.max(traditionalAmt + capGainsAmt + ssAnnualSurvivor * (Number(ssTaxablePct) / 100), 0);
+        const tierIfJoint = findIrmaaTier(magiIfBothAlive, "joint");
+        const tierAsSurvivor = findIrmaaTier(magiAsSurvivor, "single");
+        const extraIfJoint = (tierIfJoint.partBExtra + tierIfJoint.partDExtra) * 2; // both still on Medicare, hypothetical
+        const extraAsSurvivor = tierAsSurvivor.partBExtra + tierAsSurvivor.partDExtra; // one person now
+
+        return { age: r.age, magiAsSurvivor, tierIfJoint, tierAsSurvivor, extraIfJoint, extraAsSurvivor, torpedoDelta: extraAsSurvivor - extraIfJoint };
+      });
+  }, [includeWidowTorpedo, draw.rows, survivorEventAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, survivorSsReductionPct, qcdAnnualAmount]);
 
   // Sequence-of-returns risk: same average return, different order — compare constant vs bad-years-first vs bad-years-last
   const [badYearsCount, setBadYearsCount] = useState(5);
@@ -873,6 +1051,10 @@ function RetirementRunwayV4() {
     setIncludeIrmaa(false); setTaxFilingStatus("single"); setIrmaaPeopleOnMedicare(1);
     setIncludeRmd(false); setIncludeNiit(false);
     setIncludeAca(false); setAcaHouseholdSize(1); setAcaAnnualPremium(12000);
+    setQcdAnnualAmount(0);
+    setIncludeLtc(false); setLtcOnsetAge(82); setLtcDurationYears(2); setLtcCareType("assistedLiving"); setLtcAnnualCost(74400); setLtcInsurancePremium(0);
+    setIncludeWidowTorpedo(false); setSurvivorEventAge(80); setSurvivorSsReductionPct(33);
+    setHealthcareInflation(6); setCapGainsMode("flat");
     setUiMode("basic");
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
@@ -885,7 +1067,7 @@ function RetirementRunwayV4() {
 
   const [expanded, setExpanded] = useState({
     budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false, irmaa: false,
-    rmd: false, niit: false, aca: false, rothLadder: false,
+    rmd: false, niit: false, aca: false, rothLadder: false, ltc: false, widowTorpedo: false,
     ageHorizon: true, salaryRaise: true, accountsPanel: true, returns: true, targetPortfolio: true, intro: true,
   });
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1443,10 +1625,24 @@ function RetirementRunwayV4() {
               tool tracks one blended portfolio balance, not separate balances per account) — a reasonable approximation,
               not a precise projection.
             </div>
+            <div style={{ marginBottom: "10px" }}>
+              <span className="rr-field-label">Federal capital-gains rate</span>
+              <div style={{ display: "flex" }}>
+                <button className={`rr-toggle ${capGainsMode === "flat" ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setCapGainsMode("flat")}>Flat rate</button>
+                <button className={`rr-toggle ${capGainsMode === "bracket" ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setCapGainsMode("bracket")}>Auto (2026 brackets)</button>
+              </div>
+              {capGainsMode === "bracket" && (
+                <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px", lineHeight: 1.6 }}>
+                  Gains stack on top of your Traditional withdrawal + taxable Social Security to find the real
+                  0%/15%/20% federal rate (filing status shared with the IRMAA/NIIT sections elsewhere in
+                  Advanced mode), instead of one flat rate applied to every dollar.
+                </div>
+              )}
+            </div>
             <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
               <div style={{ flex: 1 }}>
-                <span className="rr-field-label">Capital gains rate %</span>
-                <input type="number" step="0.5" value={capGainsRate} onChange={(e) => setCapGainsRate(e.target.value)} />
+                <span className="rr-field-label">Capital gains rate % {capGainsMode === "bracket" ? "(unused — auto mode on)" : ""}</span>
+                <input type="number" step="0.5" value={capGainsRate} onChange={(e) => setCapGainsRate(e.target.value)} disabled={capGainsMode === "bracket"} />
               </div>
               <div style={{ flex: 1 }}>
                 <span className="rr-field-label">% of taxable balance that's gains</span>
@@ -1660,19 +1856,30 @@ function RetirementRunwayV4() {
               </button>
             </div>
             {includeRmd && (
-              rmdTable.length === 0 ? (
+              <>
+              <div style={{ marginBottom: "14px" }}>
+                <span className="rr-field-label">Planned annual QCD (qualified charitable distribution)</span>
+                <input type="number" value={qcdAnnualAmount} onChange={(e) => setQcdAnnualAmount(e.target.value)} />
+                <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px", lineHeight: 1.6 }}>
+                  Money sent straight from a Traditional IRA to charity, starting at age 70½ (not 73 — QCDs are
+                  available before RMDs even start). Excluded from taxable income and MAGI entirely, and counts
+                  toward that year's RMD. 2026 limit: {fmtMoney(QCD_ANNUAL_LIMIT_2026)}/person.
+                </div>
+              </div>
+              {rmdTable.length === 0 ? (
                 <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — you're not projected to be 73+ within this plan.</div>
               ) : (
                 <>
                 <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
                   <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
-                    <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Traditional bal.</span><span style={{ flex: 2, textAlign: "right" }}>Required RMD</span><span style={{ flex: 2, textAlign: "right" }}>Planned withdrawal</span><span style={{ flex: 2, textAlign: "right" }}>Shortfall</span>
+                    <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Traditional bal.</span><span style={{ flex: 2, textAlign: "right" }}>Required RMD</span><span style={{ flex: 2, textAlign: "right" }}>QCD applied</span><span style={{ flex: 2, textAlign: "right" }}>Taxable withdrawal</span><span style={{ flex: 2, textAlign: "right" }}>Shortfall</span>
                   </div>
                   {rmdTable.map((r) => (
                     <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
                       <span style={{ flex: 1 }}>{r.age}</span>
                       <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.traditionalBalance)}</span>
                       <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.requiredRmd)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: r.qcd > 0 ? TEAL : MUTED }}>{r.qcd > 0 ? fmtMoney(r.qcd) : "—"}</span>
                       <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.plannedTraditionalWithdrawal)}</span>
                       <span style={{ flex: 2, textAlign: "right", color: r.shortfall > 0 ? RUST : TEAL }}>{r.shortfall > 0 ? fmtMoney(r.shortfall) : "none"}</span>
                     </div>
@@ -1680,16 +1887,17 @@ function RetirementRunwayV4() {
                 </div>
                 {rmdTable.some((r) => r.shortfall > 0) && (
                   <div style={{ fontSize: "12px", color: RUST, marginBottom: "10px" }}>
-                    One or more years show a shortfall — your withdrawal rate under-draws Traditional accounts relative to what the IRS requires at that age.
+                    One or more years show a shortfall — your withdrawal rate (plus any QCD) under-draws Traditional accounts relative to what the IRS requires at that age.
                   </div>
                 )}
                 </>
-              )
+              )}
+              </>
             )}
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
               Uses the IRS Uniform Lifetime Table (unchanged since 2022). Real multi-IRA households can aggregate
               RMDs across IRAs and take the total from just one, but 401k RMDs must be taken separately per plan —
-              not modeled here. "Traditional balance" and "planned withdrawal" both use the same account-mix
+              not modeled here. "Traditional balance" and "taxable withdrawal" both use the same account-mix
               approximation as the After-Tax and IRMAA sections, not a tracked per-account balance.
             </div>
             </>
@@ -1827,6 +2035,161 @@ function RetirementRunwayV4() {
               Filing status is shared with the IRMAA section above. This is on top of, not instead of, ordinary
               capital gains tax already shown in After-Tax Withdrawals — the two aren't the same tax.
             </div>
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("ltc")}>
+              <span>LONG-TERM CARE COST STRESS TEST (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.ltc ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.ltc && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              The biggest unmodeled tail risk in most retirement plans: national median costs (CareScout/Genworth
+              2025 Cost of Care Survey) range from {fmtMoney(LTC_CARE_TYPES[0].annualCost)}/yr for home health aide
+              care up to {fmtMoney(LTC_CARE_TYPES[3].annualCost)}/yr for a private nursing home room — either as a
+              multi-year drag if self-funded, or a smaller premium every year if insured against.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeLtc ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeLtc(!includeLtc)}>
+                {includeLtc ? "Modeled below ✓" : "Not modeled — tap to add"}
+              </button>
+            </div>
+            {includeLtc && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Care need begins at age</span>
+                    <input type="number" value={ltcOnsetAge} onChange={(e) => setLtcOnsetAge(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Duration, years</span>
+                    <input type="number" min="0" value={ltcDurationYears} onChange={(e) => setLtcDurationYears(e.target.value)} />
+                  </div>
+                </div>
+                <div style={{ marginBottom: "14px" }}>
+                  <span className="rr-field-label">Care type</span>
+                  <select
+                    value={ltcCareType}
+                    onChange={(e) => {
+                      const key = e.target.value;
+                      setLtcCareType(key);
+                      const match = LTC_CARE_TYPES.find((t) => t.key === key);
+                      if (match) setLtcAnnualCost(match.annualCost);
+                    }}
+                  >
+                    {LTC_CARE_TYPES.map((t) => (<option key={t.key} value={t.key}>{t.label} — {fmtMoney(t.annualCost)}/yr</option>))}
+                  </select>
+                </div>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "18px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Annual cost if self-funded</span>
+                    <input type="number" value={ltcAnnualCost} onChange={(e) => setLtcAnnualCost(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">LTC insurance premium, $/yr (0 = uninsured)</span>
+                    <input type="number" value={ltcInsurancePremium} onChange={(e) => setLtcInsurancePremium(e.target.value)} />
+                  </div>
+                </div>
+                {ltcComparison && (
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>Scenario</span><span style={{ flex: 2, textAlign: "right" }}>Balance at {horizonAge}</span><span style={{ flex: 2, textAlign: "right" }}>Impact</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>No LTC event (baseline)</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(ltcComparison.withoutLtc)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>—</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px" }}>
+                      <span style={{ flex: 2, color: RUST }}>Self-funded at age {ltcOnsetAge}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(ltcComparison.selfFunded)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>-{fmtMoney(ltcComparison.selfFundedImpact)}</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px" }}>
+                      <span style={{ flex: 2, color: TEAL }}>Insured (premium every year)</span>
+                      <span style={{ flex: 2, textAlign: "right", color: TEAL }}>{fmtMoney(ltcComparison.insured)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: TEAL }}>-{fmtMoney(ltcComparison.insuredImpact)}</span>
+                    </div>
+                  </div>
+                )}
+                <div style={{ fontSize: "11px", color: MUTED, lineHeight: 1.6 }}>
+                  Self-funded assumes the full annual cost is withdrawn on top of your normal spending for the
+                  chosen window. Insured assumes the premium is paid every retirement year in exchange for the
+                  policy fully covering the event itself — real policies have waiting periods, benefit caps, and
+                  inflation riders not modeled here. National medians vary heavily by state and setting; get a
+                  local quote before relying on either number.
+                </div>
+              </>
+            )}
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && taxFilingStatus === "joint" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("widowTorpedo")}>
+              <span>WIDOW(ER) / SURVIVOR TAX TORPEDO (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.widowTorpedo ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.widowTorpedo && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              When the first spouse dies, filing status flips from joint to single — which <strong style={{ color: PARCHMENT }}>halves
+              the IRMAA and NIIT thresholds</strong> — while household income usually doesn't drop nearly as much:
+              Social Security drops to just the higher of the two benefits (not both), and RMDs/withdrawals
+              continue largely unchanged. The result can be a sudden jump in Medicare premiums and taxes right
+              when the survivor can least absorb it.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeWidowTorpedo ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeWidowTorpedo(!includeWidowTorpedo)}>
+                {includeWidowTorpedo ? "Stress-tested below ✓" : "Not stress-tested — tap to add"}
+              </button>
+            </div>
+            {includeWidowTorpedo && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">First spouse's death, at age</span>
+                    <input type="number" value={survivorEventAge} onChange={(e) => setSurvivorEventAge(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Household SS drop at that point, %</span>
+                    <input type="number" min="0" max="100" value={survivorSsReductionPct} onChange={(e) => setSurvivorSsReductionPct(e.target.value)} />
+                  </div>
+                </div>
+                {widowTorpedoTable.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — that age falls outside this plan's projection.</div>
+                ) : (
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>MAGI (survivor)</span><span style={{ flex: 2, textAlign: "right" }}>If still joint</span><span style={{ flex: 2, textAlign: "right" }}>As survivor</span><span style={{ flex: 2, textAlign: "right" }}>Torpedo</span>
+                    </div>
+                    {widowTorpedoTable.map((r) => (
+                      <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 1 }}>{r.age}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magiAsSurvivor)}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: MUTED }}>{fmtMoney(r.extraIfJoint)}/mo</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.torpedoDelta > 0 ? RUST : TEAL }}>{fmtMoney(r.extraAsSurvivor)}/mo</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.torpedoDelta > 0 ? RUST : TEAL }}>{r.torpedoDelta > 0 ? "+" : ""}{fmtMoney(r.torpedoDelta)}/mo</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={{ fontSize: "11px", color: MUTED, lineHeight: 1.6 }}>
+                  "If still joint" is the hypothetical IRMAA cost for that same MAGI had both spouses lived and kept
+                  filing jointly (for comparison only) — "As survivor" is the actual cost once filing single. Social
+                  Security here is approximated as a flat % reduction (this tool tracks one blended benefit, not two
+                  separate spouses' benefits) rather than the real "keep the higher, lose the lower" rule. NIIT and
+                  capital-gains bracket thresholds halve the same way at the same event, not shown separately here.
+                </div>
+              </>
+            )}
             </>
             )}
           </div>
@@ -2122,6 +2485,38 @@ function RetirementRunwayV4() {
                 <div style={{ fontSize: "16px", color: BRASS, fontWeight: 600 }}>{fmtMoney(expensePost65)}/yr</div>
               </div>
             </div>
+
+            {uiMode === "advanced" && (
+            <div style={{ marginTop: "16px", borderTop: `1px solid ${GRID}`, paddingTop: "14px" }}>
+              <div style={{ fontSize: "11px", color: MUTED, marginBottom: "10px", lineHeight: 1.6 }}>
+                Medical costs have historically inflated faster than general prices — the rest of this tool applies
+                one flat inflation rate everywhere, including to the two healthcare lines above. This estimates how
+                much that understates them specifically.
+              </div>
+              <div style={{ marginBottom: "12px" }}>
+                <span className="rr-field-label">Healthcare-specific inflation %/yr (vs. {inflation}% general)</span>
+                <input type="number" step="0.1" value={healthcareInflation} onChange={(e) => setHealthcareInflation(e.target.value)} />
+              </div>
+              {healthcareInflationComparison.length > 0 && (
+                <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden" }}>
+                  <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                    <span style={{ flex: 1 }}>In</span><span style={{ flex: 2, textAlign: "right" }}>At {inflation}% general</span><span style={{ flex: 2, textAlign: "right" }}>At {healthcareInflation}% healthcare</span>
+                  </div>
+                  {healthcareInflationComparison.map((r) => (
+                    <div key={r.years} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                      <span style={{ flex: 1 }}>{r.years}yr</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.atGeneral)}/yr</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(r.atHealthcare)}/yr</span>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+                Informational only — not wired back into the target/gap math above, same as the other optional
+                sections. If you want it reflected there, raise the healthcare budget lines above directly.
+              </div>
+            </div>
+            )}
             </>
             )}
           </div>
