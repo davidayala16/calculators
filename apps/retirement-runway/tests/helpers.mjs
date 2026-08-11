@@ -49,7 +49,7 @@ export async function expandEverything(page) {
   await page.waitForTimeout(150);
 
   const collapsedByDefaultHeaders = [
-    'SOCIAL SECURITY (OPTIONAL)', 'AFTER-TAX WITHDRAWALS', 'SPENDING GLIDE PATH',
+    'SOCIAL SECURITY (OPTIONAL)', 'AFTER-TAX WITHDRAWALS', 'MEDICARE IRMAA', 'SPENDING GLIDE PATH',
     'EARLY RETIREMENT', 'MARKET VOLATILITY', 'WITHDRAWAL ORDER', 'CONTRIBUTION LIMIT CHECK',
     'ANNUAL BUDGET', 'TAX STRATEGY',
   ];
@@ -66,6 +66,7 @@ export async function expandEverything(page) {
     'tap to cap it',
     'tap to test stopping early',
     'Not included — tap to add',
+    'Not estimated — tap to add',
   ];
   for (const t of subRevealToggles) {
     const btn = page.locator(`button:has-text("${t}")`).first();

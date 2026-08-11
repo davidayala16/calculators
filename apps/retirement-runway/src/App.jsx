@@ -199,6 +199,36 @@ function estimateSocialSecurity({ currentAge, retireAge, salary, raisePct, claim
   return { monthlyBenefit: pia * factor, aime, pia, workingYears };
 }
 
+// IRMAA (Income-Related Monthly Adjustment Amount): Medicare Part B/D premiums step up in tiers
+// once MAGI clears a threshold — a cliff, not a smooth curve. Based on MAGI from two years prior
+// (2026 premiums are set by 2024 income); this tool approximates with the current projected year's
+// income instead of modeling the two-year lag. 2026 figures (adjust most years). The top tier is
+// frozen at flat dollar amounts (not simply 2x of single) since the Bipartisan Budget Act of 2018.
+// Married filing separately has its own, much steeper two-tier structure and isn't modeled here.
+const IRMAA_STANDARD_PART_B = 202.9;
+const IRMAA_TIERS = {
+  single: [
+    { magiMax: 109000, label: "Standard", partBExtra: 0, partDExtra: 0 },
+    { magiMax: 137000, label: "Tier 1", partBExtra: 81.2, partDExtra: 14.5 },
+    { magiMax: 171000, label: "Tier 2", partBExtra: 204.0, partDExtra: 37.3 },
+    { magiMax: 205000, label: "Tier 3", partBExtra: 317.8, partDExtra: 60.1 },
+    { magiMax: 500000, label: "Tier 4", partBExtra: 422.0, partDExtra: 82.9 },
+    { magiMax: Infinity, label: "Tier 5 (top)", partBExtra: 487.0, partDExtra: 91.0 },
+  ],
+  joint: [
+    { magiMax: 218000, label: "Standard", partBExtra: 0, partDExtra: 0 },
+    { magiMax: 274000, label: "Tier 1", partBExtra: 81.2, partDExtra: 14.5 },
+    { magiMax: 342000, label: "Tier 2", partBExtra: 204.0, partDExtra: 37.3 },
+    { magiMax: 410000, label: "Tier 3", partBExtra: 317.8, partDExtra: 60.1 },
+    { magiMax: 750000, label: "Tier 4", partBExtra: 422.0, partDExtra: 82.9 },
+    { magiMax: Infinity, label: "Tier 5 (top)", partBExtra: 487.0, partDExtra: 91.0 },
+  ],
+};
+function findIrmaaTier(magi, filingStatus) {
+  const tiers = IRMAA_TIERS[filingStatus] || IRMAA_TIERS.single;
+  return tiers.find((t) => magi <= t.magiMax) || tiers[tiers.length - 1];
+}
+
 function RetirementRunwayV4() {
   const [currentAge, setCurrentAge] = useState(30);
   const [uiMode, setUiMode] = useState("basic"); // "basic" | "advanced"
@@ -245,6 +275,9 @@ function RetirementRunwayV4() {
   const [taxableGainsFraction, setTaxableGainsFraction] = useState(50);
   const [stateTaxRate, setStateTaxRate] = useState(0);
   const [ssTaxablePct, setSsTaxablePct] = useState(85);
+  const [includeIrmaa, setIncludeIrmaa] = useState(false);
+  const [irmaaFilingStatus, setIrmaaFilingStatus] = useState("single"); // "single" | "joint"
+  const [irmaaPeopleOnMedicare, setIrmaaPeopleOnMedicare] = useState(1); // 1 or 2
 
   // Persistence: fully self-contained, no account or backend calls of any kind. Two layers:
   // a debounced localStorage autosave (this browser only, survives refresh/crash, no action
@@ -295,6 +328,9 @@ function RetirementRunwayV4() {
     if (p.taxableGainsFraction !== undefined) setTaxableGainsFraction(p.taxableGainsFraction);
     if (p.stateTaxRate !== undefined) setStateTaxRate(p.stateTaxRate);
     if (p.ssTaxablePct !== undefined) setSsTaxablePct(p.ssTaxablePct);
+    if (p.includeIrmaa !== undefined) setIncludeIrmaa(p.includeIrmaa);
+    if (p.irmaaFilingStatus !== undefined) setIrmaaFilingStatus(p.irmaaFilingStatus);
+    if (p.irmaaPeopleOnMedicare !== undefined) setIrmaaPeopleOnMedicare(p.irmaaPeopleOnMedicare);
   };
 
   const encodeProfile = (obj) => {
@@ -355,6 +391,7 @@ function RetirementRunwayV4() {
     currentMarginalRate, retirementMarginalRate, includeSS, ssClaimAge, ssOverrideMonthly,
     priorWorkingYears, priorAvgSalary, hsaCoverage, useSpendingSmile, capGainsRate,
     taxableGainsFraction, stateTaxRate, ssTaxablePct,
+    includeIrmaa, irmaaFilingStatus, irmaaPeopleOnMedicare,
   };
 
   // Autosave to localStorage, debounced so rapid typing doesn't hit disk on every keystroke.
@@ -578,6 +615,29 @@ function RetirementRunwayV4() {
     return { rothAmt, traditionalAmt, hsaAmt, taxableAmt, traditionalTax, taxableTax, ssGross, ssTax, totalTax, totalGrossWithSS, netAfterTax };
   }, [withdrawalAtRetirement, accountMix, retirementMarginalRate, stateTaxRate, capGainsRate, taxableGainsFraction, includeSS, ssMonthly, ssTaxablePct]);
 
+  // Medicare IRMAA: sampled every 5 years from the first Medicare-eligible age (65, or later if
+  // retiring after 65), same age-grid convention as the withdrawal table above. MAGI here reuses
+  // the same account-mix approximation as afterTaxBreakdown, applied per row instead of just at
+  // retirement.
+  const irmaaTable = useMemo(() => {
+    if (!includeIrmaa) return [];
+    const firstAge = Math.max(65, Number(retireAge));
+    return draw.rows
+      .filter((r) => r.age >= 65 && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
+        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const taxableAmt = annualWithdrawal * accountMix.taxable;
+        const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
+        const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
+        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt, 0);
+        const tier = findIrmaaTier(magi, irmaaFilingStatus);
+        const extraMonthly = (tier.partBExtra + tier.partDExtra) * Number(irmaaPeopleOnMedicare);
+        return { age: r.age, magi, tier, extraMonthly };
+      });
+  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, irmaaFilingStatus, irmaaPeopleOnMedicare]);
+
   // Sequence-of-returns risk: same average return, different order — compare constant vs bad-years-first vs bad-years-last
   const [badYearsCount, setBadYearsCount] = useState(5);
   const [badYearReturn, setBadYearReturn] = useState(-10);
@@ -652,6 +712,7 @@ function RetirementRunwayV4() {
     setCurrentMarginalRate(12); setRetirementMarginalRate(12);
     setIncludeSS(false); setSsClaimAge(67); setSsOverrideMonthly(null); setPriorWorkingYears(0); setPriorAvgSalary(75000);
     setUseSpendingSmile(false); setCapGainsRate(15); setTaxableGainsFraction(50); setStateTaxRate(0); setSsTaxablePct(85);
+    setIncludeIrmaa(false); setIrmaaFilingStatus("single"); setIrmaaPeopleOnMedicare(1);
     setUiMode("basic");
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
@@ -663,7 +724,7 @@ function RetirementRunwayV4() {
   const removeExpense = (id) => setExpenses((prev) => prev.filter((e) => e.id !== id));
 
   const [expanded, setExpanded] = useState({
-    budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false,
+    budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false, irmaa: false,
     ageHorizon: true, salaryRaise: true, accountsPanel: true, returns: true, targetPortfolio: true, intro: true,
   });
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1299,6 +1360,93 @@ function RetirementRunwayV4() {
 
           {uiMode === "advanced" && (
           <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("irmaa")}>
+              <span>MEDICARE IRMAA — HIGH-INCOME SURCHARGE (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.irmaa ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.irmaa && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Medicare isn't flat-rate once you're on it: if your MAGI (Modified Adjusted Gross Income) runs high
+              enough, Part B and Part D premiums step up in tiers — this is IRMAA (Income-Related Monthly Adjustment
+              Amount). It's a cliff, not a smooth curve — $1 over a threshold triggers the whole next tier's surcharge.
+              It's also based on MAGI from <strong style={{ color: PARCHMENT }}>two years earlier</strong> (2026
+              premiums are set by 2024 income), so a single high-withdrawal year can raise your premium two years
+              later even after you've scaled back.
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeIrmaa ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeIrmaa(!includeIrmaa)}>
+                {includeIrmaa ? "Estimated below ✓" : "Not estimated — tap to add"}
+              </button>
+            </div>
+
+            {includeIrmaa && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Filing status</span>
+                    <div style={{ display: "flex" }}>
+                      <button className={`rr-toggle ${irmaaFilingStatus === "single" ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setIrmaaFilingStatus("single")}>Single</button>
+                      <button className={`rr-toggle ${irmaaFilingStatus === "joint" ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIrmaaFilingStatus("joint")}>Married, joint</button>
+                    </div>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">People on Medicare</span>
+                    <div style={{ display: "flex" }}>
+                      <button className={`rr-toggle ${Number(irmaaPeopleOnMedicare) === 1 ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setIrmaaPeopleOnMedicare(1)}>1</button>
+                      <button className={`rr-toggle ${Number(irmaaPeopleOnMedicare) === 2 ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIrmaaPeopleOnMedicare(2)}>2</button>
+                    </div>
+                  </div>
+                </div>
+
+                {irmaaTable.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — you're not projected to be 65+ within this plan.</div>
+                ) : (
+                  <>
+                  <div style={{ border: `1px solid ${irmaaTable[0].tier.label === "Standard" ? GRID : RUST}`, borderRadius: "4px", padding: "12px", marginBottom: "14px", background: PANEL_2 }}>
+                    <div className="rr-field-label">At age {irmaaTable[0].age} (first Medicare year)</div>
+                    <div className="rr-serif" style={{ fontSize: "22px", fontWeight: 700, color: irmaaTable[0].tier.label === "Standard" ? TEAL : RUST }}>
+                      {irmaaTable[0].tier.label === "Standard" ? "Standard premium — no surcharge" : `${irmaaTable[0].tier.label}: +${fmtMoney(irmaaTable[0].extraMonthly)}/mo`}
+                    </div>
+                    <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>
+                      Projected MAGI ≈ {fmtMoney(irmaaTable[0].magi)}/yr. Standard Part B alone is {fmtMoney(IRMAA_STANDARD_PART_B)}/mo per person in 2026.
+                    </div>
+                  </div>
+
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 2 }}>Tier</span><span style={{ flex: 2, textAlign: "right" }}>Extra/mo</span>
+                    </div>
+                    {irmaaTable.map((r) => (
+                      <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 1 }}>{r.age}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magi)}</span>
+                        <span style={{ flex: 2, color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.tier.label}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.extraMonthly > 0 ? fmtMoney(r.extraMonthly) : "$0"}</span>
+                      </div>
+                    ))}
+                  </div>
+                  </>
+                )}
+
+                <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+                  Estimate only, using 2026 published brackets (these adjust most years) and this year's projected
+                  withdrawal mix as a stand-in for the real two-years-prior lookback. Married filing separately has
+                  its own, much steeper two-tier structure not modeled here. This surcharge is{" "}
+                  <strong style={{ color: PARCHMENT }}>not</strong> automatically folded into your target or budget
+                  above — if you want it reflected there, add the extra monthly amount to "Healthcare, after Medicare
+                  (65+)" in your Annual Budget.
+                </div>
+              </>
+            )}
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
             <button className="rr-collapsible-header" onClick={() => toggle("smile")}>
               <span>SPENDING GLIDE PATH — RESEARCH-BASED</span>
               <span className="rr-caret" style={{ transform: expanded.smile ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
@@ -1683,6 +1831,9 @@ function RetirementRunwayV4() {
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Withdrawal income (after-tax est.)</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{fmtMoney(dv(afterTaxBreakdown.netAfterTax, Number(retireAge)))}/yr</td></tr>
             {includeSS && (
               <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Est. Social Security (claim age {ssClaimAge})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{fmtMoney(ssMonthly)}/mo</td></tr>
+            )}
+            {includeIrmaa && irmaaTable.length > 0 && (
+              <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Est. Medicare IRMAA surcharge (age {irmaaTable[0].age})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{irmaaTable[0].tier.label === "Standard" ? "none" : `+${fmtMoney(irmaaTable[0].extraMonthly)}/mo`}</td></tr>
             )}
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Earliest FIRE age</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{earliestFireAge || `${horizonAge}+`}</td></tr>
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Coast FIRE age (for retiring at {retireAge})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{coastFireAge !== null ? coastFireAge : `not by ${retireAge}`}</td></tr>
