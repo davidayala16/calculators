@@ -49,7 +49,10 @@ export async function expandEverything(page) {
   await page.waitForTimeout(150);
 
   // "OWNERSHIP COSTS" starts expanded by default — everything else here starts collapsed.
-  const collapsedByDefaultHeaders = ['BUYING & SELLING COSTS', 'RENTAL DETAILS', 'TAX TREATMENT'];
+  const collapsedByDefaultHeaders = [
+    'BUYING & SELLING COSTS', 'RENTAL DETAILS', 'TAX TREATMENT',
+    'EXTRA PAYMENTS & POINTS', 'CAN YOU AFFORD THIS?', 'AMORTIZATION SCHEDULE',
+  ];
   for (const h of collapsedByDefaultHeaders) {
     const btn = page.locator(`button.rvb-collapsible-header:has-text("${h}")`).first();
     if (await btn.count()) {

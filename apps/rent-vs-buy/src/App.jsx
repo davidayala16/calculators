@@ -3,7 +3,7 @@ import {
   LineChart, Line, XAxis, YAxis, CartesianGrid, Tooltip, ReferenceLine, ResponsiveContainer,
 } from 'recharts';
 import GradientSlider from './GradientSlider.jsx';
-import { simulateRentVsBuy, monthlyMortgagePayment, computeSliderDirections } from './model.js';
+import { simulateRentVsBuy, computeSliderDirections, computeAffordability } from './model.js';
 
 const INK = "#12141C";
 const PANEL = "#1B1F2B";
@@ -13,6 +13,8 @@ const PARCHMENT = "#EAEAF2";
 const MUTED = "#8B90A8";
 const BUY = "#E2704A";
 const RENT = "#4F8EF7";
+const OK = "#4CAF7A";
+const WARN = "#E0B03B";
 
 const AUTOSAVE_KEY = "rent-vs-buy:autosave-v1";
 
@@ -29,9 +31,12 @@ const DEFAULTS = {
   homeAppreciationPct: 3.5, monthlyRent: 2200, rentGrowthPct: 3, investmentReturnPct: 7,
   yearsToStay: 10,
   propertyTaxPct: 1.1, homeInsuranceAnnual: 1800, maintenancePct: 1, hoaMonthly: 0, pmiPct: 0.5,
+  costInflationPct: 3,
   closingCostBuyPct: 3, closingCostSellPct: 6,
+  discountPoints: 0, extraPrincipalMonthly: 0,
   rentersInsuranceMonthly: 15,
   marginalTaxRatePct: 24, standardDeductionAnnual: 29200, itemizeDeductions: false,
+  annualIncome: 100000, monthlyOtherDebts: 0,
   uiMode: "basic",
 };
 
@@ -42,6 +47,7 @@ const FIELD_RANGES = {
   homePrice: { min: 100000, max: 2000000 },
   downPaymentPct: { min: 0, max: 100 },
   mortgageRatePct: { min: 0, max: 12 },
+  mortgageTermYears: { min: 10, max: 30 },
   monthlyRent: { min: 500, max: 10000 },
   yearsToStay: { min: 1, max: 40 },
   investmentReturnPct: { min: 0, max: 15 },
@@ -49,8 +55,11 @@ const FIELD_RANGES = {
   propertyTaxPct: { min: 0, max: 4 },
   maintenancePct: { min: 0, max: 4 },
   pmiPct: { min: 0, max: 2 },
+  costInflationPct: { min: 0, max: 8 },
   closingCostBuyPct: { min: 0, max: 8 },
   closingCostSellPct: { min: 0, max: 10 },
+  discountPoints: { min: 0, max: 4 },
+  extraPrincipalMonthly: { min: 0, max: 2000 },
   rentGrowthPct: { min: 0, max: 10 },
   marginalTaxRatePct: { min: 0, max: 50 },
 };
@@ -71,15 +80,23 @@ function RentVsBuyCalculator() {
   const [maintenancePct, setMaintenancePct] = useState(DEFAULTS.maintenancePct);
   const [hoaMonthly, setHoaMonthly] = useState(DEFAULTS.hoaMonthly);
   const [pmiPct, setPmiPct] = useState(DEFAULTS.pmiPct);
+  const [costInflationPct, setCostInflationPct] = useState(DEFAULTS.costInflationPct);
   const [closingCostBuyPct, setClosingCostBuyPct] = useState(DEFAULTS.closingCostBuyPct);
   const [closingCostSellPct, setClosingCostSellPct] = useState(DEFAULTS.closingCostSellPct);
+  const [discountPoints, setDiscountPoints] = useState(DEFAULTS.discountPoints);
+  const [extraPrincipalMonthly, setExtraPrincipalMonthly] = useState(DEFAULTS.extraPrincipalMonthly);
   const [rentersInsuranceMonthly, setRentersInsuranceMonthly] = useState(DEFAULTS.rentersInsuranceMonthly);
   const [marginalTaxRatePct, setMarginalTaxRatePct] = useState(DEFAULTS.marginalTaxRatePct);
   const [standardDeductionAnnual, setStandardDeductionAnnual] = useState(DEFAULTS.standardDeductionAnnual);
   const [itemizeDeductions, setItemizeDeductions] = useState(DEFAULTS.itemizeDeductions);
+  const [annualIncome, setAnnualIncome] = useState(DEFAULTS.annualIncome);
+  const [monthlyOtherDebts, setMonthlyOtherDebts] = useState(DEFAULTS.monthlyOtherDebts);
 
   const [uiMode, setUiMode] = useState(DEFAULTS.uiMode);
-  const [expanded, setExpanded] = useState({ ownership: true, transaction: false, rental: false, tax: false, about: false });
+  const [expanded, setExpanded] = useState({
+    ownership: true, transaction: false, rental: false, tax: false, about: false,
+    extraPayments: false, amortization: false, affordability: false,
+  });
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
 
   const hydrated = useRef(false);
@@ -102,12 +119,17 @@ function RentVsBuyCalculator() {
     if (p.maintenancePct !== undefined) setMaintenancePct(p.maintenancePct);
     if (p.hoaMonthly !== undefined) setHoaMonthly(p.hoaMonthly);
     if (p.pmiPct !== undefined) setPmiPct(p.pmiPct);
+    if (p.costInflationPct !== undefined) setCostInflationPct(p.costInflationPct);
     if (p.closingCostBuyPct !== undefined) setClosingCostBuyPct(p.closingCostBuyPct);
     if (p.closingCostSellPct !== undefined) setClosingCostSellPct(p.closingCostSellPct);
+    if (p.discountPoints !== undefined) setDiscountPoints(p.discountPoints);
+    if (p.extraPrincipalMonthly !== undefined) setExtraPrincipalMonthly(p.extraPrincipalMonthly);
     if (p.rentersInsuranceMonthly !== undefined) setRentersInsuranceMonthly(p.rentersInsuranceMonthly);
     if (p.marginalTaxRatePct !== undefined) setMarginalTaxRatePct(p.marginalTaxRatePct);
     if (p.standardDeductionAnnual !== undefined) setStandardDeductionAnnual(p.standardDeductionAnnual);
     if (p.itemizeDeductions !== undefined) setItemizeDeductions(p.itemizeDeductions);
+    if (p.annualIncome !== undefined) setAnnualIncome(p.annualIncome);
+    if (p.monthlyOtherDebts !== undefined) setMonthlyOtherDebts(p.monthlyOtherDebts);
     if (p.uiMode !== undefined) setUiMode(p.uiMode);
   };
 
@@ -119,9 +141,11 @@ function RentVsBuyCalculator() {
   const profileSnapshot = {
     homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
     monthlyRent, rentGrowthPct, investmentReturnPct, yearsToStay,
-    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
-    closingCostBuyPct, closingCostSellPct, rentersInsuranceMonthly,
-    marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions, uiMode,
+    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct, costInflationPct,
+    closingCostBuyPct, closingCostSellPct, discountPoints, extraPrincipalMonthly,
+    rentersInsuranceMonthly,
+    marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
+    annualIncome, monthlyOtherDebts, uiMode,
   };
 
   const buildShareUrl = () => {
@@ -186,16 +210,20 @@ function RentVsBuyCalculator() {
     setYearsToStay(DEFAULTS.yearsToStay); setPropertyTaxPct(DEFAULTS.propertyTaxPct);
     setHomeInsuranceAnnual(DEFAULTS.homeInsuranceAnnual); setMaintenancePct(DEFAULTS.maintenancePct);
     setHoaMonthly(DEFAULTS.hoaMonthly); setPmiPct(DEFAULTS.pmiPct);
+    setCostInflationPct(DEFAULTS.costInflationPct);
     setClosingCostBuyPct(DEFAULTS.closingCostBuyPct); setClosingCostSellPct(DEFAULTS.closingCostSellPct);
+    setDiscountPoints(DEFAULTS.discountPoints); setExtraPrincipalMonthly(DEFAULTS.extraPrincipalMonthly);
     setRentersInsuranceMonthly(DEFAULTS.rentersInsuranceMonthly);
     setMarginalTaxRatePct(DEFAULTS.marginalTaxRatePct); setStandardDeductionAnnual(DEFAULTS.standardDeductionAnnual);
-    setItemizeDeductions(DEFAULTS.itemizeDeductions); setUiMode(DEFAULTS.uiMode);
+    setItemizeDeductions(DEFAULTS.itemizeDeductions);
+    setAnnualIncome(DEFAULTS.annualIncome); setMonthlyOtherDebts(DEFAULTS.monthlyOtherDebts);
+    setUiMode(DEFAULTS.uiMode);
   };
 
   const currentInputs = {
     homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
-    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
-    closingCostBuyPct, closingCostSellPct,
+    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct, costInflationPct,
+    closingCostBuyPct, closingCostSellPct, discountPoints, extraPrincipalMonthly,
     monthlyRent, rentGrowthPct, rentersInsuranceMonthly,
     investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
     yearsToStay,
@@ -203,8 +231,8 @@ function RentVsBuyCalculator() {
 
   const result = useMemo(() => simulateRentVsBuy(currentInputs), [
     homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
-    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
-    closingCostBuyPct, closingCostSellPct,
+    propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct, costInflationPct,
+    closingCostBuyPct, closingCostSellPct, discountPoints, extraPrincipalMonthly,
     monthlyRent, rentGrowthPct, rentersInsuranceMonthly,
     investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
     yearsToStay,
@@ -217,8 +245,8 @@ function RentVsBuyCalculator() {
     () => computeSliderDirections(currentInputs, FIELD_RANGES, result.netWorthGap),
     [
       homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears, homeAppreciationPct,
-      propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct,
-      closingCostBuyPct, closingCostSellPct,
+      propertyTaxPct, homeInsuranceAnnual, maintenancePct, hoaMonthly, pmiPct, costInflationPct,
+      closingCostBuyPct, closingCostSellPct, discountPoints, extraPrincipalMonthly,
       monthlyRent, rentGrowthPct, rentersInsuranceMonthly,
       investmentReturnPct, marginalTaxRatePct, standardDeductionAnnual, itemizeDeductions,
       yearsToStay, result.netWorthGap,
@@ -228,10 +256,11 @@ function RentVsBuyCalculator() {
   const buyWins = result.netWorthGap >= 0;
   const gapAbs = Math.abs(result.netWorthGap);
   const winnerColor = buyWins ? BUY : RENT;
+  const cashToClose = result.downPayment + result.buyingClosingCosts + result.pointsCost;
 
-  const previewPayment = useMemo(
-    () => monthlyMortgagePayment(homePrice * (1 - downPaymentPct / 100), mortgageRatePct, mortgageTermYears),
-    [homePrice, downPaymentPct, mortgageRatePct, mortgageTermYears]
+  const affordability = useMemo(
+    () => computeAffordability(result.firstMonthHousingCostForDTI, monthlyOtherDebts, annualIncome),
+    [result.firstMonthHousingCostForDTI, monthlyOtherDebts, annualIncome]
   );
 
   return (
@@ -312,15 +341,26 @@ function RentVsBuyCalculator() {
           Autosaves in this browser as you go. Tap "Copy shareable link" to bookmark or send a specific scenario.
         </p>
 
-        <div style={{ marginTop: "22px" }}>
-          <div className="rvb-field-label">After {yearsToStay} years</div>
-          <div className="rvb-serif" style={{ fontSize: "34px", fontWeight: 700, color: winnerColor, lineHeight: 1.2 }}>
-            {buyWins ? "Buying" : "Renting"} wins by {fmtMoney(gapAbs)}
+        <div style={{ marginTop: "22px", display: "flex", gap: "40px", flexWrap: "wrap" }}>
+          <div>
+            <div className="rvb-field-label">After {yearsToStay} years</div>
+            <div className="rvb-serif" style={{ fontSize: "34px", fontWeight: 700, color: winnerColor, lineHeight: 1.2 }}>
+              {buyWins ? "Buying" : "Renting"} wins by {fmtMoney(gapAbs)}
+            </div>
+            <div style={{ fontSize: "12px", color: MUTED, marginTop: "4px" }}>
+              {result.breakevenYear !== null
+                ? `The two paths cross around year ${result.breakevenYear} — before that, ${buyWins ? "renting" : "buying"} was ahead.`
+                : `${buyWins ? "Buying" : "Renting"} stays ahead the whole time on these numbers.`}
+            </div>
           </div>
-          <div style={{ fontSize: "12px", color: MUTED, marginTop: "4px" }}>
-            {result.breakevenYear !== null
-              ? `The two paths cross around year ${result.breakevenYear} — before that, ${buyWins ? "renting" : "buying"} was ahead.`
-              : `${buyWins ? "Buying" : "Renting"} stays ahead the whole time on these numbers.`}
+          <div>
+            <div className="rvb-field-label">Cash needed to close</div>
+            <div className="rvb-serif" style={{ fontSize: "34px", fontWeight: 700, color: PARCHMENT, lineHeight: 1.2 }}>
+              {fmtMoney(cashToClose)}
+            </div>
+            <div style={{ fontSize: "12px", color: MUTED, marginTop: "4px" }}>
+              Down payment + closing costs{discountPoints > 0 ? " + points" : ""} — the money you'd actually need on day one.
+            </div>
           </div>
         </div>
       </div>
@@ -337,6 +377,7 @@ function RentVsBuyCalculator() {
           <GradientSlider label="Home price" value={homePrice} min={FIELD_RANGES.homePrice.min} max={FIELD_RANGES.homePrice.max} step={5000} onChange={setHomePrice} prefix="$" reversed={sliderDirections.homePrice === "rent"} />
           <GradientSlider label="Down payment" value={downPaymentPct} min={FIELD_RANGES.downPaymentPct.min} max={FIELD_RANGES.downPaymentPct.max} step={1} onChange={setDownPaymentPct} suffix="%" derived={(v) => fmtMoney(homePrice * (v / 100), true)} reversed={sliderDirections.downPaymentPct === "rent"} />
           <GradientSlider label="Mortgage rate" value={mortgageRatePct} min={FIELD_RANGES.mortgageRatePct.min} max={FIELD_RANGES.mortgageRatePct.max} step={0.125} onChange={setMortgageRatePct} suffix="%" reversed={sliderDirections.mortgageRatePct === "rent"} />
+          <GradientSlider label="Mortgage term" value={mortgageTermYears} min={FIELD_RANGES.mortgageTermYears.min} max={FIELD_RANGES.mortgageTermYears.max} step={1} onChange={setMortgageTermYears} suffix="yr" reversed={sliderDirections.mortgageTermYears === "rent"} />
           <GradientSlider label="Monthly rent (equivalent home)" value={monthlyRent} min={FIELD_RANGES.monthlyRent.min} max={FIELD_RANGES.monthlyRent.max} step={50} onChange={setMonthlyRent} prefix="$" reversed={sliderDirections.monthlyRent === "rent"} />
           <GradientSlider label="Years you'll stay" value={yearsToStay} min={FIELD_RANGES.yearsToStay.min} max={FIELD_RANGES.yearsToStay.max} step={1} onChange={setYearsToStay} suffix="yr" reversed={sliderDirections.yearsToStay === "rent"} />
           <GradientSlider label="Investment return, if renting" value={investmentReturnPct} min={FIELD_RANGES.investmentReturnPct.min} max={FIELD_RANGES.investmentReturnPct.max} step={0.25} onChange={setInvestmentReturnPct} suffix="%" reversed={sliderDirections.investmentReturnPct === "rent"}
@@ -344,7 +385,8 @@ function RentVsBuyCalculator() {
           <GradientSlider label="Home price appreciation" value={homeAppreciationPct} min={FIELD_RANGES.homeAppreciationPct.min} max={FIELD_RANGES.homeAppreciationPct.max} step={0.25} onChange={setHomeAppreciationPct} suffix="%" reversed={sliderDirections.homeAppreciationPct === "rent"} />
 
           <div style={{ fontSize: "11px", color: MUTED, marginTop: "8px", marginBottom: "18px", lineHeight: 1.6 }}>
-            Estimated mortgage payment: <strong style={{ color: PARCHMENT }}>{fmtMoney(previewPayment)}/mo</strong> (principal + interest only, {mortgageTermYears}-yr term)
+            Estimated mortgage payment: <strong style={{ color: PARCHMENT }}>{fmtMoney(result.monthlyPayment)}/mo</strong> (principal + interest only, {mortgageTermYears}-yr term
+            {discountPoints > 0 ? `, ${fmtPct(result.effectiveMortgageRatePct)} after points` : ""})
           </div>
 
           {uiMode === "advanced" && (
@@ -366,6 +408,8 @@ function RentVsBuyCalculator() {
                     <input type="number" value={hoaMonthly} onChange={(e) => setHoaMonthly(e.target.value)} />
                   </div>
                   <GradientSlider label="PMI (while equity < 20%)" value={pmiPct} min={FIELD_RANGES.pmiPct.min} max={FIELD_RANGES.pmiPct.max} step={0.05} onChange={setPmiPct} suffix="%/yr" reversed={sliderDirections.pmiPct === "rent"} />
+                  <GradientSlider label="Insurance & HOA cost growth" value={costInflationPct} min={FIELD_RANGES.costInflationPct.min} max={FIELD_RANGES.costInflationPct.max} step={0.25} onChange={setCostInflationPct} suffix="%/yr" reversed={sliderDirections.costInflationPct === "rent"}
+                    helpText="Property tax and maintenance already scale with home value; this grows insurance and HOA dues too, since those go up over time as well." />
                 </>
               )}
 
@@ -417,6 +461,75 @@ function RentVsBuyCalculator() {
                         that excess, times your marginal rate, is credited monthly against owning's cost.
                       </div>
                     </>
+                  )}
+                </>
+              )}
+
+              <button className="rvb-collapsible-header" onClick={() => toggle("extraPayments")} style={{ marginTop: "20px" }}>
+                <span>EXTRA PAYMENTS &amp; POINTS</span>
+                <span className="rvb-caret" style={{ transform: expanded.extraPayments ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+              </button>
+              {expanded.extraPayments && (
+                <>
+                  <div style={{ fontSize: "11px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+                    Two optional strategies, off by default. Both are real cash out of your pocket at the time —
+                    that money isn't available to invest either, so both flow through the same cost comparison
+                    as everything else above.
+                  </div>
+                  <div style={{ marginBottom: "14px" }}>
+                    <span className="rvb-field-label">Extra principal payment ($/mo)</span>
+                    <input type="number" value={extraPrincipalMonthly} onChange={(e) => setExtraPrincipalMonthly(e.target.value)} />
+                  </div>
+                  {extraPrincipalMonthly > 0 && result.payoffYears !== null && (
+                    <div style={{ fontSize: "11px", color: MUTED, marginBottom: "14px" }}>
+                      Pays off the loan in ~{result.payoffYears.toFixed(1)} years instead of {mortgageTermYears}.
+                    </div>
+                  )}
+                  <GradientSlider label="Discount points" value={discountPoints} min={FIELD_RANGES.discountPoints.min} max={FIELD_RANGES.discountPoints.max} step={0.125} onChange={setDiscountPoints} suffix="pts" derived={(v) => fmtMoney(homePrice * (1 - downPaymentPct / 100) * (v / 100), true)} reversed={sliderDirections.discountPoints === "rent"}
+                    helpText="Paid upfront at closing (1 point = 1% of your loan amount) to buy down the rate — assumes 0.25% off the rate per point, a common rule of thumb." />
+                  {discountPoints > 0 && (
+                    <div style={{ fontSize: "11px", color: MUTED, marginBottom: "14px" }}>
+                      {fmtMoney(result.pointsCost)} upfront gets you {fmtPct(mortgageRatePct)} → {fmtPct(result.effectiveMortgageRatePct)}.
+                    </div>
+                  )}
+                </>
+              )}
+
+              <button className="rvb-collapsible-header" onClick={() => toggle("affordability")} style={{ marginTop: "20px" }}>
+                <span>CAN YOU AFFORD THIS?</span>
+                <span className="rvb-caret" style={{ transform: expanded.affordability ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+              </button>
+              {expanded.affordability && (
+                <>
+                  <div style={{ fontSize: "11px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+                    A general guideline lenders use, not a lending decision: housing costs at or under 28% of gross
+                    income, and total debt (housing plus everything else) at or under 36%. Real approvals vary.
+                  </div>
+                  <div style={{ marginBottom: "14px" }}>
+                    <span className="rvb-field-label">Gross annual household income ($)</span>
+                    <input type="number" value={annualIncome} onChange={(e) => setAnnualIncome(e.target.value)} />
+                  </div>
+                  <div style={{ marginBottom: "14px" }}>
+                    <span className="rvb-field-label">Other monthly debt payments ($)</span>
+                    <input type="number" value={monthlyOtherDebts} onChange={(e) => setMonthlyOtherDebts(e.target.value)} />
+                  </div>
+                  {affordability.frontEndOk === null ? (
+                    <div style={{ fontSize: "12px", color: MUTED }}>Enter your income to see your ratios.</div>
+                  ) : (
+                    <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden" }}>
+                      <div className="rvb-row" style={{ padding: "10px 12px" }}>
+                        <span style={{ fontSize: "12px" }}>Housing / income (front-end)</span>
+                        <span className="rvb-mono" style={{ fontSize: "13px", fontWeight: 600, color: affordability.frontEndOk ? OK : WARN }}>
+                          {fmtPct(affordability.frontEndDTI)} {affordability.frontEndOk ? "✓" : "⚠"}
+                        </span>
+                      </div>
+                      <div className="rvb-row" style={{ padding: "10px 12px" }}>
+                        <span style={{ fontSize: "12px" }}>All debt / income (back-end)</span>
+                        <span className="rvb-mono" style={{ fontSize: "13px", fontWeight: 600, color: affordability.backEndOk ? OK : WARN }}>
+                          {fmtPct(affordability.backEndDTI)} {affordability.backEndOk ? "✓" : "⚠"}
+                        </span>
+                      </div>
+                    </div>
                   )}
                 </>
               )}
@@ -481,11 +594,44 @@ function RentVsBuyCalculator() {
               </div>
             </div>
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "8px", lineHeight: 1.6 }}>
-              Renting's total assumes the down payment and buying closing costs
-              ({fmtMoney(result.downPayment + result.buyingClosingCosts)}) went into the market on day one,
-              plus whichever side had lower monthly cash costs each month invested the difference — so the two
-              numbers are comparable dollar-for-dollar, not just "home equity" vs. "rent paid."
+              Renting's total assumes the cash needed to close ({fmtMoney(cashToClose)}) went into the market on
+              day one, plus whichever side had lower monthly cash costs each month invested the difference — so
+              the two numbers are comparable dollar-for-dollar, not just "home equity" vs. "rent paid."
             </div>
+          </div>
+
+          <div style={{ marginTop: "30px", marginBottom: "10px" }}>
+            <button className="rvb-collapsible-header" onClick={() => toggle("amortization")}>
+              <span>AMORTIZATION SCHEDULE</span>
+              <span className="rvb-caret" style={{ transform: expanded.amortization ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.amortization && (
+              <>
+                <div style={{ fontSize: "11px", color: MUTED, marginBottom: "12px", lineHeight: 1.6 }}>
+                  Principal and interest paid each year, and what's left on the loan — through year {yearsToStay},
+                  the length of the comparison above{result.payoffYears !== null && result.payoffYears < yearsToStay
+                    ? `, though the loan itself is fully paid off around year ${result.payoffYears.toFixed(1)}` : ""}.
+                </div>
+                <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", maxHeight: "360px", overflowY: "auto" }}>
+                  <div className="rvb-row rvb-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px", position: "sticky", top: 0 }}>
+                    <span style={{ flex: 1 }}>Year</span>
+                    <span style={{ flex: 2, textAlign: "right" }}>Principal</span>
+                    <span style={{ flex: 2, textAlign: "right" }}>Interest</span>
+                    <span style={{ flex: 2, textAlign: "right" }}>Balance</span>
+                    <span style={{ flex: 2, textAlign: "right" }}>Equity</span>
+                  </div>
+                  {result.rows.slice(1).map((r) => (
+                    <div key={r.year} className="rvb-row rvb-mono" style={{ fontSize: "12px", padding: "8px 12px" }}>
+                      <span style={{ flex: 1 }}>{r.year}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.principalPaid)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.interestPaid)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.mortgageBalance)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.homeEquity)}</span>
+                    </div>
+                  ))}
+                </div>
+              </>
+            )}
           </div>
 
           <div style={{ marginTop: "30px", marginBottom: "10px" }}>

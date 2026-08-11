@@ -12,6 +12,7 @@
 export const MAX_YEARS = 100;
 export const MAX_DOLLARS = 1e12;
 const SALT_CAP_ANNUAL = 10000; // federal cap on the deductible portion of property tax
+const POINT_RATE_REDUCTION = 0.25; // percentage points of rate reduced per discount point — a common industry rule of thumb, not a lender-specific quote
 
 function clampYears(y) {
   const n = Math.trunc(Number(y));
@@ -53,10 +54,13 @@ export function simulateRentVsBuy(inputs) {
   const propertyTaxPct = Math.max(Number(inputs.propertyTaxPct) || 0, 0);
   const homeInsuranceAnnual = Math.max(Number(inputs.homeInsuranceAnnual) || 0, 0);
   const maintenancePct = Math.max(Number(inputs.maintenancePct) || 0, 0);
-  const hoaMonthly = Math.max(Number(inputs.hoaMonthly) || 0, 0);
+  const hoaMonthlyInput = Math.max(Number(inputs.hoaMonthly) || 0, 0);
+  const costInflationPct = Number(inputs.costInflationPct) || 0;
   const closingCostBuyPct = Math.max(Number(inputs.closingCostBuyPct) || 0, 0);
   const closingCostSellPct = Math.max(Number(inputs.closingCostSellPct) || 0, 0);
   const pmiPct = Math.max(Number(inputs.pmiPct) || 0, 0);
+  const discountPoints = Math.max(Number(inputs.discountPoints) || 0, 0);
+  const extraPrincipalMonthly = Math.max(Number(inputs.extraPrincipalMonthly) || 0, 0);
   const monthlyRent = Math.max(Number(inputs.monthlyRent) || 0, 0);
   const rentGrowthPct = Number(inputs.rentGrowthPct) || 0;
   const rentersInsuranceMonthly = Math.max(Number(inputs.rentersInsuranceMonthly) || 0, 0);
@@ -70,18 +74,23 @@ export function simulateRentVsBuy(inputs) {
   const downPayment = clampDollars(homePrice * (downPaymentPct / 100));
   const loanAmount = clampDollars(Math.max(homePrice - downPayment, 0));
   const buyingClosingCosts = clampDollars(homePrice * (closingCostBuyPct / 100));
-  const payment = monthlyMortgagePayment(loanAmount, mortgageRatePct, mortgageTermYears);
-  const monthlyMortgageRate = mortgageRatePct / 100 / 12;
+  const effectiveMortgageRatePct = Math.max(mortgageRatePct - discountPoints * POINT_RATE_REDUCTION, 0);
+  const pointsCost = clampDollars(loanAmount * (discountPoints / 100));
+  const payment = monthlyMortgagePayment(loanAmount, effectiveMortgageRatePct, mortgageTermYears);
+  const monthlyMortgageRate = effectiveMortgageRatePct / 100 / 12;
 
   const monthlyAppreciation = monthlyRateFromAnnual(homeAppreciationPct);
   const monthlyRentGrowth = monthlyRateFromAnnual(rentGrowthPct);
   const monthlyInvestmentReturn = monthlyRateFromAnnual(investmentReturnPct);
+  const monthlyCostInflation = monthlyRateFromAnnual(costInflationPct);
 
   let mortgageBalance = loanAmount;
   let homeValue = homePrice;
   let rent = monthlyRent;
+  let insuranceAnnual = homeInsuranceAnnual;
+  let hoaMonthlyValue = hoaMonthlyInput;
   let buyerInvestments = 0;
-  let renterInvestments = clampDollars(downPayment + buyingClosingCosts);
+  let renterInvestments = clampDollars(downPayment + buyingClosingCosts + pointsCost);
 
   const rows = [{
     year: 0,
@@ -90,25 +99,41 @@ export function simulateRentVsBuy(inputs) {
     homeEquity: clampDollars(homeValue - mortgageBalance),
     buyerNetWorth: clampDollars(homeValue - mortgageBalance - homeValue * (closingCostSellPct / 100) + buyerInvestments),
     renterNetWorth: clampDollars(renterInvestments),
+    principalPaid: 0,
+    interestPaid: 0,
   }];
 
   let firstMonthOwnCost = null;
   let firstMonthRentCost = null;
+  let firstMonthHousingCostForDTI = null;
+  let payoffMonth = null;
+  let yearPrincipal = 0;
+  let yearInterest = 0;
 
   for (let m = 1; m <= months; m++) {
     homeValue = clampDollars(homeValue * (1 + monthlyAppreciation));
 
-    const interestPortion = mortgageBalance * monthlyMortgageRate;
-    const principalPortion = Math.min(Math.max(payment - interestPortion, 0), mortgageBalance);
-    mortgageBalance = clampDollars(Math.max(mortgageBalance - principalPortion, 0));
+    const loanActive = mortgageBalance > 0;
+    const interestPortion = loanActive ? mortgageBalance * monthlyMortgageRate : 0;
+    const scheduledPrincipal = loanActive ? Math.min(Math.max(payment - interestPortion, 0), mortgageBalance) : 0;
+    const extraPrincipal = loanActive ? Math.min(extraPrincipalMonthly, Math.max(mortgageBalance - scheduledPrincipal, 0)) : 0;
+    mortgageBalance = clampDollars(Math.max(mortgageBalance - scheduledPrincipal - extraPrincipal, 0));
+    if (payoffMonth === null && loanActive && mortgageBalance === 0) payoffMonth = m;
+    yearPrincipal += scheduledPrincipal + extraPrincipal;
+    yearInterest += interestPortion;
 
     const propertyTaxMonthly = (homeValue * (propertyTaxPct / 100)) / 12;
-    const insuranceMonthly = homeInsuranceAnnual / 12;
+    const insuranceMonthly = insuranceAnnual / 12;
     const maintenanceMonthly = (homeValue * (maintenancePct / 100)) / 12;
     const equityFraction = homeValue > 0 ? (homeValue - mortgageBalance) / homeValue : 1;
     const pmiMonthly = equityFraction < 0.2 ? (mortgageBalance * (pmiPct / 100)) / 12 : 0;
+    const requiredMortgagePayment = loanActive ? (interestPortion + scheduledPrincipal) : 0;
 
-    const ownCashOutflow = payment + propertyTaxMonthly + insuranceMonthly + maintenanceMonthly + hoaMonthly + pmiMonthly;
+    // What a lender would actually count toward DTI: the required (non-extra) payment plus
+    // taxes/insurance/HOA/PMI — not maintenance (not a debt payment) and not voluntary extra
+    // principal (not required).
+    const housingCostForDTI = requiredMortgagePayment + propertyTaxMonthly + insuranceMonthly + hoaMonthlyValue + pmiMonthly;
+    const ownCashOutflow = requiredMortgagePayment + extraPrincipal + propertyTaxMonthly + insuranceMonthly + maintenanceMonthly + hoaMonthlyValue + pmiMonthly;
 
     let taxBenefitMonthly = 0;
     if (itemizeDeductions) {
@@ -122,6 +147,7 @@ export function simulateRentVsBuy(inputs) {
     if (firstMonthOwnCost === null) {
       firstMonthOwnCost = netOwnCost;
       firstMonthRentCost = rentCost;
+      firstMonthHousingCostForDTI = housingCostForDTI;
     }
 
     if (netOwnCost > rentCost) {
@@ -132,6 +158,8 @@ export function simulateRentVsBuy(inputs) {
     buyerInvestments = clampDollars(buyerInvestments * (1 + monthlyInvestmentReturn));
     renterInvestments = clampDollars(renterInvestments * (1 + monthlyInvestmentReturn));
     rent = clampDollars(rent * (1 + monthlyRentGrowth));
+    insuranceAnnual = clampDollars(insuranceAnnual * (1 + monthlyCostInflation));
+    hoaMonthlyValue = clampDollars(hoaMonthlyValue * (1 + monthlyCostInflation));
 
     if (m % 12 === 0) {
       const sellingCosts = homeValue * (closingCostSellPct / 100);
@@ -142,7 +170,11 @@ export function simulateRentVsBuy(inputs) {
         homeEquity: clampDollars(homeValue - mortgageBalance),
         buyerNetWorth: clampDollars(homeValue - mortgageBalance - sellingCosts + buyerInvestments),
         renterNetWorth: clampDollars(renterInvestments),
+        principalPaid: clampDollars(yearPrincipal),
+        interestPaid: clampDollars(yearInterest),
       });
+      yearPrincipal = 0;
+      yearInterest = 0;
     }
   }
 
@@ -169,11 +201,15 @@ export function simulateRentVsBuy(inputs) {
     netWorthGap,
     breakevenYear,
     monthlyPayment: payment,
+    effectiveMortgageRatePct,
+    pointsCost,
     loanAmount,
     downPayment,
     buyingClosingCosts,
     firstMonthOwnCost,
     firstMonthRentCost,
+    firstMonthHousingCostForDTI,
+    payoffYears: payoffMonth !== null ? payoffMonth / 12 : null,
   };
 }
 
@@ -199,4 +235,26 @@ export function computeSliderDirections(inputs, fieldRanges, baseGap) {
     directions[field] = nudgedGap >= baseGap ? "buy" : "rent";
   }
   return directions;
+}
+
+// Standard conventional-loan affordability guideline: front-end ratio (housing cost alone)
+// at or under 28% of gross monthly income, back-end ratio (housing + all other debt) at or
+// under 36%. Actual lenders vary and often go higher with compensating factors — this is a
+// general rule of thumb, not a lending decision, and the UI says so.
+export function computeAffordability(monthlyHousingCost, monthlyOtherDebts, annualIncome) {
+  const monthlyIncome = Math.max(Number(annualIncome) || 0, 0) / 12;
+  const debts = Math.max(Number(monthlyOtherDebts) || 0, 0);
+  const housing = Math.max(Number(monthlyHousingCost) || 0, 0);
+  if (monthlyIncome <= 0) {
+    return { frontEndDTI: 0, backEndDTI: 0, frontEndOk: null, backEndOk: null, monthlyIncome: 0 };
+  }
+  const frontEndDTI = (housing / monthlyIncome) * 100;
+  const backEndDTI = ((housing + debts) / monthlyIncome) * 100;
+  return {
+    frontEndDTI,
+    backEndDTI,
+    frontEndOk: frontEndDTI <= 28,
+    backEndOk: backEndDTI <= 36,
+    monthlyIncome,
+  };
 }
