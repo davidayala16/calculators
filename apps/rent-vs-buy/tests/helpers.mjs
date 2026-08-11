@@ -5,7 +5,7 @@ import { spawn } from 'node:child_process';
 import { chromium } from 'playwright';
 
 const PORT = 4322;
-export const BASE_URL = `http://localhost:${PORT}/financial-calculators/rent-vs-buy/`;
+export const BASE_URL = `http://localhost:${PORT}/calculators/rent-vs-buy/`;
 
 export async function startPreviewServer() {
   const proc = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], {

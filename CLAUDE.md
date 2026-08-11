@@ -6,8 +6,8 @@ existing one.
 
 ## What this repo is
 
-A small collection of self-contained financial-planning calculators —
-static sites, no backend, no accounts. See `README.md` for the current
+A small collection of self-contained calculators — financial planning
+and beyond, static sites, no backend, no accounts. See `README.md` for the current
 list and the live URL. Each app lives under `apps/<name>/` as its own
 Vite + React project; a single GitHub Actions workflow
 (`.github/workflows/deploy-pages.yml`) builds every directory under
@@ -25,7 +25,7 @@ below. Apply them from the start on the next one and skip that cycle.
 1. `apps/<name>/` — a new Vite + React project. Copy
    `apps/retirement-runway/` as a starting skeleton (config, `.gitignore`,
    error boundary in `main.jsx`) rather than starting from scratch.
-2. Set `base: '/financial-calculators/<name>/'` in `vite.config.js` —
+2. Set `base: '/calculators/<name>/'` in `vite.config.js` —
    must match the directory name exactly, since the workflow deploys
    each app to a path of the same name.
 3. Implement the **persistence pattern** and the **crash-proofing
