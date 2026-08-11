@@ -11,6 +11,11 @@ export async function startPreviewServer() {
   const proc = spawn('npx', ['vite', 'preview', '--port', String(PORT), '--strictPort'], {
     cwd: new URL('..', import.meta.url).pathname,
     stdio: 'pipe',
+    // `npx` spawns the real vite server as a grandchild (via an intermediate shell) — killing just
+    // the npx pid can leave that grandchild orphaned and running, which keeps its stdio pipes open
+    // and the whole `node --test` process alive indefinitely even after every test has passed.
+    // `detached: true` gives the tree its own process group, so stopPreviewServer can kill all of it.
+    detached: true,
   });
   const ready = new Promise((resolve, reject) => {
     let out = '';
@@ -30,7 +35,12 @@ export async function startPreviewServer() {
 }
 
 export function stopPreviewServer(proc) {
-  if (proc && !proc.killed) proc.kill();
+  if (!proc || proc.killed) return;
+  try {
+    process.kill(-proc.pid, 'SIGTERM'); // negative pid = whole process group, reaches the grandchild
+  } catch (e) {
+    proc.kill(); // group already gone — fall back to signaling just the direct child
+  }
 }
 
 export async function launchBrowser() {
@@ -49,7 +59,8 @@ export async function expandEverything(page) {
   await page.waitForTimeout(150);
 
   const collapsedByDefaultHeaders = [
-    'SOCIAL SECURITY (OPTIONAL)', 'AFTER-TAX WITHDRAWALS', 'SPENDING GLIDE PATH',
+    'SOCIAL SECURITY (OPTIONAL)', 'AFTER-TAX WITHDRAWALS', 'ROTH CONVERSION LADDER', 'ACA SUBSIDY CLIFF',
+    'REQUIRED MINIMUM DISTRIBUTIONS', 'MEDICARE IRMAA', 'NIIT —', 'SPENDING GLIDE PATH',
     'EARLY RETIREMENT', 'MARKET VOLATILITY', 'WITHDRAWAL ORDER', 'CONTRIBUTION LIMIT CHECK',
     'ANNUAL BUDGET', 'TAX STRATEGY',
   ];
@@ -66,12 +77,17 @@ export async function expandEverything(page) {
     'tap to cap it',
     'tap to test stopping early',
     'Not included — tap to add',
+    'Not estimated — tap to add',
   ];
+  // Several sections (IRMAA/RMD/NIIT/ACA) share identical toggle copy, so more than one button can
+  // match a given label — loop until none remain instead of clicking only the first.
   for (const t of subRevealToggles) {
-    const btn = page.locator(`button:has-text("${t}")`).first();
-    if (await btn.count()) {
-      await btn.click();
+    const locator = page.locator(`button:has-text("${t}")`);
+    let count = await locator.count();
+    while (count > 0) {
+      await locator.first().click();
       await page.waitForTimeout(80);
+      count = await locator.count();
     }
   }
   await page.waitForTimeout(200);

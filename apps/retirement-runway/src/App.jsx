@@ -199,6 +199,84 @@ function estimateSocialSecurity({ currentAge, retireAge, salary, raisePct, claim
   return { monthlyBenefit: pia * factor, aime, pia, workingYears };
 }
 
+// IRMAA (Income-Related Monthly Adjustment Amount): Medicare Part B/D premiums step up in tiers
+// once MAGI clears a threshold — a cliff, not a smooth curve. Based on MAGI from two years prior
+// (2026 premiums are set by 2024 income); this tool approximates with the current projected year's
+// income instead of modeling the two-year lag. 2026 figures (adjust most years). The top tier is
+// frozen at flat dollar amounts (not simply 2x of single) since the Bipartisan Budget Act of 2018.
+// Married filing separately has its own, much steeper two-tier structure and isn't modeled here.
+const IRMAA_STANDARD_PART_B = 202.9;
+const IRMAA_TIERS = {
+  single: [
+    { magiMax: 109000, label: "Standard", partBExtra: 0, partDExtra: 0 },
+    { magiMax: 137000, label: "Tier 1", partBExtra: 81.2, partDExtra: 14.5 },
+    { magiMax: 171000, label: "Tier 2", partBExtra: 204.0, partDExtra: 37.3 },
+    { magiMax: 205000, label: "Tier 3", partBExtra: 317.8, partDExtra: 60.1 },
+    { magiMax: 500000, label: "Tier 4", partBExtra: 422.0, partDExtra: 82.9 },
+    { magiMax: Infinity, label: "Tier 5 (top)", partBExtra: 487.0, partDExtra: 91.0 },
+  ],
+  joint: [
+    { magiMax: 218000, label: "Standard", partBExtra: 0, partDExtra: 0 },
+    { magiMax: 274000, label: "Tier 1", partBExtra: 81.2, partDExtra: 14.5 },
+    { magiMax: 342000, label: "Tier 2", partBExtra: 204.0, partDExtra: 37.3 },
+    { magiMax: 410000, label: "Tier 3", partBExtra: 317.8, partDExtra: 60.1 },
+    { magiMax: 750000, label: "Tier 4", partBExtra: 422.0, partDExtra: 82.9 },
+    { magiMax: Infinity, label: "Tier 5 (top)", partBExtra: 487.0, partDExtra: 91.0 },
+  ],
+};
+function findIrmaaTier(magi, filingStatus) {
+  const tiers = IRMAA_TIERS[filingStatus] || IRMAA_TIERS.single;
+  return tiers.find((t) => magi <= t.magiMax) || tiers[tiers.length - 1];
+}
+
+// IRS Uniform Lifetime Table (Treasury Reg. §1.401(a)(9)-9(c)) — unchanged since the 2022 update,
+// used every distribution year since including 2026. Distribution period shrinks with age, so the
+// required withdrawal grows as a % of balance even if the balance itself holds flat. RMDs apply
+// only to Traditional-type balances (Roth IRAs never had them; Roth 401k/403b/457 RMDs were
+// eliminated by SECURE 2.0 starting 2024) — approximated here via the same account-mix split used
+// elsewhere. Start age is simplified to a flat 73 (SECURE 2.0 raises it to 75 for those born 1960+,
+// not modeled since this tool doesn't collect birth year — same simplification already used in the
+// Withdrawal Order section above).
+const RMD_START_AGE = 73;
+const RMD_DIVISORS = {
+  73: 26.5, 74: 25.5, 75: 24.6, 76: 23.7, 77: 22.9, 78: 22.0, 79: 21.1, 80: 20.2,
+  81: 19.4, 82: 18.5, 83: 17.7, 84: 16.8, 85: 16.0, 86: 15.2, 87: 14.4, 88: 13.7,
+  89: 12.9, 90: 12.2, 91: 11.5, 92: 10.8, 93: 10.1, 94: 9.5, 95: 8.9, 96: 8.4,
+  97: 7.8, 98: 7.3, 99: 6.8, 100: 6.4, 101: 6.0, 102: 5.6, 103: 5.2, 104: 4.9,
+  105: 4.6, 106: 4.3, 107: 4.1, 108: 3.9, 109: 3.7, 110: 3.5, 111: 3.4, 112: 3.3,
+  113: 3.1, 114: 3.0, 115: 2.9, 116: 2.8, 117: 2.7, 118: 2.5, 119: 2.3, 120: 2.0,
+};
+function rmdDivisor(age) {
+  const a = Math.min(Math.max(Math.trunc(age), RMD_START_AGE), 120);
+  return RMD_DIVISORS[a];
+}
+
+// NIIT (Net Investment Income Tax): flat 3.8% surtax on the lesser of net investment income or
+// the amount MAGI exceeds this threshold. Fixed by statute since 2013 — not inflation-indexed, so
+// these numbers don't need a "figures as of year X" caveat the way brackets elsewhere do. Applies
+// to investment income only (capital gains here) — ordinary retirement-account withdrawals and
+// Social Security are specifically excluded from NII by statute.
+const NIIT_RATE = 0.038;
+const NIIT_THRESHOLD = { single: 200000, joint: 250000 };
+
+// 2026 ACA premium tax credit inputs. The enhanced (ARPA/IRA) subsidy formula expired December 31,
+// 2025 and Congress did not extend it, so 2026 reverts to the original ACA statute: a hard cliff at
+// 400% FPL (zero subsidy above it, vs. no cliff 2021-2025) and steeper "applicable percentage" — the
+// share of MAGI you're expected to pay toward the benchmark plan below that cliff (IRS Rev. Proc.
+// 2025-25). FPL guidelines are the 48-contiguous-states-plus-DC figures (HHS, published Jan 2026);
+// Alaska and Hawaii use higher bases and aren't modeled here.
+const FPL_BASE_2026 = 15960; // 1-person household, 48 states + DC
+const FPL_PER_ADDITIONAL_PERSON_2026 = 5680;
+function acaApplicablePct(fplPct) {
+  if (fplPct < 133) return 2.1;
+  if (fplPct < 150) return 3.14 + (4.19 - 3.14) * ((fplPct - 133) / (150 - 133));
+  if (fplPct < 200) return 4.19 + (6.6 - 4.19) * ((fplPct - 150) / (200 - 150));
+  if (fplPct < 250) return 6.6 + (8.44 - 6.6) * ((fplPct - 200) / (250 - 200));
+  if (fplPct < 300) return 8.44 + (9.96 - 8.44) * ((fplPct - 250) / (300 - 250));
+  if (fplPct <= 400) return 9.96;
+  return null; // over 400% FPL: the cliff — zero subsidy, full premium
+}
+
 function RetirementRunwayV4() {
   const [currentAge, setCurrentAge] = useState(30);
   const [uiMode, setUiMode] = useState("basic"); // "basic" | "advanced"
@@ -245,6 +323,15 @@ function RetirementRunwayV4() {
   const [taxableGainsFraction, setTaxableGainsFraction] = useState(50);
   const [stateTaxRate, setStateTaxRate] = useState(0);
   const [ssTaxablePct, setSsTaxablePct] = useState(85);
+  // Shared by IRMAA, NIIT, and (indirectly) ACA below — filing jointly changes each one's income threshold.
+  const [taxFilingStatus, setTaxFilingStatus] = useState("single"); // "single" | "joint"
+  const [includeIrmaa, setIncludeIrmaa] = useState(false);
+  const [irmaaPeopleOnMedicare, setIrmaaPeopleOnMedicare] = useState(1); // 1 or 2
+  const [includeRmd, setIncludeRmd] = useState(false);
+  const [includeNiit, setIncludeNiit] = useState(false);
+  const [includeAca, setIncludeAca] = useState(false);
+  const [acaHouseholdSize, setAcaHouseholdSize] = useState(1);
+  const [acaAnnualPremium, setAcaAnnualPremium] = useState(12000);
 
   // Persistence: fully self-contained, no account or backend calls of any kind. Two layers:
   // a debounced localStorage autosave (this browser only, survives refresh/crash, no action
@@ -295,6 +382,14 @@ function RetirementRunwayV4() {
     if (p.taxableGainsFraction !== undefined) setTaxableGainsFraction(p.taxableGainsFraction);
     if (p.stateTaxRate !== undefined) setStateTaxRate(p.stateTaxRate);
     if (p.ssTaxablePct !== undefined) setSsTaxablePct(p.ssTaxablePct);
+    if (p.includeIrmaa !== undefined) setIncludeIrmaa(p.includeIrmaa);
+    if (p.taxFilingStatus !== undefined) setTaxFilingStatus(p.taxFilingStatus);
+    if (p.irmaaPeopleOnMedicare !== undefined) setIrmaaPeopleOnMedicare(p.irmaaPeopleOnMedicare);
+    if (p.includeRmd !== undefined) setIncludeRmd(p.includeRmd);
+    if (p.includeNiit !== undefined) setIncludeNiit(p.includeNiit);
+    if (p.includeAca !== undefined) setIncludeAca(p.includeAca);
+    if (p.acaHouseholdSize !== undefined) setAcaHouseholdSize(p.acaHouseholdSize);
+    if (p.acaAnnualPremium !== undefined) setAcaAnnualPremium(p.acaAnnualPremium);
   };
 
   const encodeProfile = (obj) => {
@@ -355,6 +450,8 @@ function RetirementRunwayV4() {
     currentMarginalRate, retirementMarginalRate, includeSS, ssClaimAge, ssOverrideMonthly,
     priorWorkingYears, priorAvgSalary, hsaCoverage, useSpendingSmile, capGainsRate,
     taxableGainsFraction, stateTaxRate, ssTaxablePct,
+    includeIrmaa, taxFilingStatus, irmaaPeopleOnMedicare,
+    includeRmd, includeNiit, includeAca, acaHouseholdSize, acaAnnualPremium,
   };
 
   // Autosave to localStorage, debounced so rapid typing doesn't hit disk on every keystroke.
@@ -578,6 +675,127 @@ function RetirementRunwayV4() {
     return { rothAmt, traditionalAmt, hsaAmt, taxableAmt, traditionalTax, taxableTax, ssGross, ssTax, totalTax, totalGrossWithSS, netAfterTax };
   }, [withdrawalAtRetirement, accountMix, retirementMarginalRate, stateTaxRate, capGainsRate, taxableGainsFraction, includeSS, ssMonthly, ssTaxablePct]);
 
+  // Medicare IRMAA: sampled every 5 years from the first Medicare-eligible age (65, or later if
+  // retiring after 65), same age-grid convention as the withdrawal table above. MAGI here reuses
+  // the same account-mix approximation as afterTaxBreakdown, applied per row instead of just at
+  // retirement.
+  const irmaaTable = useMemo(() => {
+    if (!includeIrmaa) return [];
+    const firstAge = Math.max(65, Number(retireAge));
+    return draw.rows
+      .filter((r) => r.age >= 65 && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
+        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const taxableAmt = annualWithdrawal * accountMix.taxable;
+        const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
+        const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
+        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt, 0);
+        const tier = findIrmaaTier(magi, taxFilingStatus);
+        const extraMonthly = (tier.partBExtra + tier.partDExtra) * Number(irmaaPeopleOnMedicare);
+        return { age: r.age, magi, tier, extraMonthly };
+      });
+  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, irmaaPeopleOnMedicare]);
+
+  // Required Minimum Distributions: sampled every 5 years from age 73 on (same grid convention as
+  // the IRMAA table above). "Traditional balance" and "planned Traditional withdrawal" are both the
+  // same account-mix approximation used throughout — this tool tracks one blended balance, not a
+  // separate Traditional-only balance over time.
+  const rmdTable = useMemo(() => {
+    if (!includeRmd) return [];
+    const firstAge = Math.max(RMD_START_AGE, Number(retireAge));
+    return draw.rows
+      .filter((r) => r.age >= RMD_START_AGE && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const traditionalBalance = r.balance * accountMix.traditional;
+        const requiredRmd = traditionalBalance / rmdDivisor(r.age);
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const plannedTraditionalWithdrawal = annualWithdrawal * accountMix.traditional;
+        const shortfall = Math.max(requiredRmd - plannedTraditionalWithdrawal, 0);
+        return { age: r.age, traditionalBalance, requiredRmd, plannedTraditionalWithdrawal, shortfall };
+      });
+  }, [includeRmd, draw.rows, retireAge, accountMix, withdrawalRate, useSpendingSmile]);
+
+  // NIIT: unlike IRMAA/RMD this isn't age-gated — it applies any year MAGI clears the threshold.
+  // Sampled every 5 years from retirement on, same table style as the rest of this section.
+  const niitTable = useMemo(() => {
+    if (!includeNiit) return [];
+    const firstAge = Number(retireAge);
+    return draw.rows
+      .filter((r) => r.age === firstAge || (r.age - firstAge) % 5 === 0)
+      .map((r) => {
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
+        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const taxableAmt = annualWithdrawal * accountMix.taxable;
+        const nii = taxableAmt * (Number(taxableGainsFraction) / 100); // net investment income ≈ the gains portion of taxable withdrawals
+        const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
+        const magi = Math.max(traditionalAmt + nii + ssTaxableAmt, 0);
+        const threshold = NIIT_THRESHOLD[taxFilingStatus] || NIIT_THRESHOLD.single;
+        const niitOwed = NIIT_RATE * Math.max(Math.min(nii, magi - threshold), 0);
+        return { age: r.age, magi, nii, niitOwed };
+      });
+  }, [includeNiit, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus]);
+
+  // ACA subsidy cliff: only the pre-Medicare gap years matter here (retirement age through 64).
+  // Requires a user-supplied premium estimate since this tool has no geographic/age-rated plan
+  // pricing data — the subsidy dollar figure is only as good as that input.
+  const acaTable = useMemo(() => {
+    if (!includeAca) return [];
+    const firstAge = Number(retireAge);
+    const lastGapAge = Math.min(64, Number(horizonAge));
+    if (firstAge > lastGapAge) return [];
+    const fplBase = FPL_BASE_2026 + FPL_PER_ADDITIONAL_PERSON_2026 * Math.max(Number(acaHouseholdSize) - 1, 0);
+    return draw.rows
+      .filter((r) => r.age >= firstAge && r.age <= lastGapAge && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const annualWithdrawal = r.balance * (Number(withdrawalRate) / 100) * (useSpendingSmile ? spendingSmileFactor(r.age) : 1);
+        const ssAnnual = includeSS && r.age >= Number(ssClaimAge) ? ssMonthly * 12 : 0;
+        const traditionalAmt = annualWithdrawal * accountMix.traditional;
+        const taxableAmt = annualWithdrawal * accountMix.taxable;
+        const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
+        const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
+        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt, 0);
+        const fplPct = fplBase > 0 ? (magi / fplBase) * 100 : 0;
+        const applicablePct = acaApplicablePct(fplPct);
+        const cliff = applicablePct === null;
+        const expectedContribution = cliff ? Number(acaAnnualPremium) : magi * (applicablePct / 100);
+        const subsidy = cliff ? 0 : Math.max(Number(acaAnnualPremium) - expectedContribution, 0);
+        const netPremium = Number(acaAnnualPremium) - subsidy;
+        return { age: r.age, magi, fplPct, cliff, subsidy, netPremium };
+      });
+  }, [includeAca, draw.rows, retireAge, horizonAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, acaHouseholdSize, acaAnnualPremium]);
+
+  // Roth conversion ladder: a bridge-to-59½ planning table, not tied to any new toggle state — it's
+  // fully derived from inputs that already exist elsewhere (expense budget, inflation, tax rates).
+  // Each "rung" converted this year becomes penalty-free principal 5 years later; only rungs that
+  // mature before 59½ are shown, since ordinary penalty-free Traditional access kicks in at 59½
+  // anyway. The first 5 gap years still need another bridge (Roth contributions, taxable brokerage,
+  // 72(t) SEPP — see the FIRE section above) since no rung has matured yet.
+  const rothLadderRungs = useMemo(() => {
+    // floored at 0 and capped to bridgeEnd - 5: an extreme/transient negative retireAge (e.g. while
+    // another field is mid-edit) would otherwise iterate this loop hundreds of thousands of times.
+    const bridgeStart = Math.min(Math.max(Number(retireAge), 0), 59.5 - 5);
+    const bridgeEnd = 59.5;
+    if (bridgeStart >= bridgeEnd) return [];
+    const rungs = [];
+    for (let convertAge = bridgeStart; convertAge + 5 < bridgeEnd; convertAge++) {
+      const accessAge = convertAge + 5;
+      // clamped to MAX_YEARS: an extreme/transient currentAge (e.g. mid-edit) would otherwise send
+      // Math.pow a huge exponent, same overflow risk the compounding loops elsewhere guard against.
+      const yearsOut = Math.min(Math.max(accessAge - Number(currentAge), 0), MAX_YEARS);
+      const futureAnnualNeed = Math.min(expensePre65 * Math.pow(1 + Number(inflation) / 100, yearsOut), MAX_BALANCE);
+      const conversionTaxRate = (Number(retirementMarginalRate) + Number(stateTaxRate)) / 100;
+      rungs.push({
+        convertAge, accessAge,
+        convertAmount: futureAnnualNeed,
+        estTax: futureAnnualNeed * conversionTaxRate,
+      });
+    }
+    return rungs;
+  }, [retireAge, currentAge, expensePre65, inflation, retirementMarginalRate, stateTaxRate]);
+
   // Sequence-of-returns risk: same average return, different order — compare constant vs bad-years-first vs bad-years-last
   const [badYearsCount, setBadYearsCount] = useState(5);
   const [badYearReturn, setBadYearReturn] = useState(-10);
@@ -652,6 +870,9 @@ function RetirementRunwayV4() {
     setCurrentMarginalRate(12); setRetirementMarginalRate(12);
     setIncludeSS(false); setSsClaimAge(67); setSsOverrideMonthly(null); setPriorWorkingYears(0); setPriorAvgSalary(75000);
     setUseSpendingSmile(false); setCapGainsRate(15); setTaxableGainsFraction(50); setStateTaxRate(0); setSsTaxablePct(85);
+    setIncludeIrmaa(false); setTaxFilingStatus("single"); setIrmaaPeopleOnMedicare(1);
+    setIncludeRmd(false); setIncludeNiit(false);
+    setIncludeAca(false); setAcaHouseholdSize(1); setAcaAnnualPremium(12000);
     setUiMode("basic");
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
@@ -663,7 +884,8 @@ function RetirementRunwayV4() {
   const removeExpense = (id) => setExpenses((prev) => prev.filter((e) => e.id !== id));
 
   const [expanded, setExpanded] = useState({
-    budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false,
+    budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false, irmaa: false,
+    rmd: false, niit: false, aca: false, rothLadder: false,
     ageHorizon: true, salaryRaise: true, accountsPanel: true, returns: true, targetPortfolio: true, intro: true,
   });
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1299,6 +1521,319 @@ function RetirementRunwayV4() {
 
           {uiMode === "advanced" && (
           <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("rothLadder")}>
+              <span>ROTH CONVERSION LADDER — BRIDGE TO 59½ (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.rothLadder ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.rothLadder && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Most Traditional 401k/IRA money can't be touched penalty-free before 59½. A Roth conversion ladder is
+              a common bridge: convert Traditional funds to a Roth IRA a little at a time, pay ordinary income tax on
+              each conversion in the year you make it, then after a <strong style={{ color: PARCHMENT }}>5-year
+              seasoning period per conversion</strong>, that converted amount (not later growth) can be withdrawn
+              penalty-free — even before 59½. Each year's conversion runs its own independent 5-year clock.
+            </div>
+            {rothLadderRungs.length === 0 ? (
+              <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>
+                Not applicable — retiring at {retireAge} doesn't leave a gap before 59½ (or it's too short for a rung to mature in time).
+              </div>
+            ) : (
+              <>
+              <div style={{ fontSize: "11px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+                The first 5 years of retirement still need another bridge — no rung has matured yet. Common options:
+                original Roth IRA contributions (withdrawable anytime, tax- and penalty-free), taxable brokerage funds,
+                or 72(t)/SEPP scheduled withdrawals.
+              </div>
+              <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                  <span style={{ flex: 1 }}>Convert at</span><span style={{ flex: 2, textAlign: "right" }}>Convert amount</span><span style={{ flex: 1, textAlign: "right" }}>Access at</span><span style={{ flex: 2, textAlign: "right" }}>Est. tax owed</span>
+                </div>
+                {rothLadderRungs.map((r) => (
+                  <div key={r.convertAge} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                    <span style={{ flex: 1 }}>{r.convertAge}</span>
+                    <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.convertAmount)}</span>
+                    <span style={{ flex: 1, textAlign: "right" }}>{r.accessAge}</span>
+                    <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(r.estTax)}</span>
+                  </div>
+                ))}
+              </div>
+              </>
+            )}
+            <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+              Convert amounts are each rung's future annual expense (from your budget above, inflated to the year
+              you'd need it), using your expected retirement tax rate — a simplification, not a bracket-filling
+              optimization. A real conversion strategy would size each year's conversion to fill up your remaining
+              low tax bracket space, and would check the amount against the ACA subsidy cliff below if you're
+              retiring before 65 — a big conversion can push MAGI past the cliff and wipe out a year of subsidies.
+            </div>
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("aca")}>
+              <span>ACA SUBSIDY CLIFF — PRE-MEDICARE GAP (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.aca ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.aca && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              If you retire before 65, you're buying your own health insurance until Medicare kicks in — and how much
+              you pay depends heavily on your MAGI. Marketplace (ACA) subsidies phase out on a sliding scale as income
+              rises, then <strong style={{ color: PARCHMENT }}>disappear entirely above 400% of the federal poverty
+              level</strong> — a hard cliff, not a gradual taper. That cliff briefly went away for 2021–2025 under a
+              temporary federal expansion; it wasn't renewed, so as of 2026 it's back in force.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeAca ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeAca(!includeAca)}>
+                {includeAca ? "Estimated below ✓" : "Not estimated — tap to add"}
+              </button>
+            </div>
+            {includeAca && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Household size (people on the plan)</span>
+                    <input type="number" min="1" value={acaHouseholdSize} onChange={(e) => setAcaHouseholdSize(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Est. unsubsidized annual premium</span>
+                    <input type="number" value={acaAnnualPremium} onChange={(e) => setAcaAnnualPremium(e.target.value)} />
+                  </div>
+                </div>
+                {acaTable.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>
+                    Nothing to show — either there's no gap before 65 (retiring at {retireAge}), or the plan doesn't run that far.
+                  </div>
+                ) : (
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 1, textAlign: "right" }}>% FPL</span><span style={{ flex: 2, textAlign: "right" }}>Subsidy/yr</span><span style={{ flex: 2, textAlign: "right" }}>Net premium/yr</span>
+                    </div>
+                    {acaTable.map((r) => (
+                      <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 1 }}>{r.age}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magi)}</span>
+                        <span style={{ flex: 1, textAlign: "right", color: r.cliff ? RUST : MUTED }}>{Math.round(r.fplPct)}%</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.cliff ? RUST : TEAL }}>{r.cliff ? "$0 (cliff)" : fmtMoney(r.subsidy)}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.netPremium)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </>
+            )}
+            <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+              Uses 2026 federal poverty guidelines for the 48 contiguous states + DC (Alaska/Hawaii use higher bases,
+              not modeled) and the reverted original ACA subsidy formula. Below 100% of FPL you likely don't qualify
+              for marketplace subsidies at all (Medicaid eligibility instead, state-dependent — not modeled). The
+              subsidy estimate is only as accurate as the premium you enter above — real premiums vary heavily by
+              age, location, and plan tier; check healthcare.gov or your state exchange for an actual quote.
+            </div>
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("rmd")}>
+              <span>REQUIRED MINIMUM DISTRIBUTIONS — AGE 73+ (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.rmd ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.rmd && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Traditional 401k/IRA balances force withdrawals starting at age 73 (SECURE 2.0; rises to 75 for those
+              born 1960+, not modeled here since this tool doesn't collect birth year), whether you need the income
+              or not. Roth accounts are exempt — Roth IRAs never had RMDs, and Roth 401k/403b/457 RMDs were
+              eliminated starting 2024. If your chosen withdrawal rate draws less from the Traditional bucket than
+              the IRS requires, you're forced to take the difference anyway — extra taxable income that can also
+              push you into a higher IRMAA tier (see below).
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeRmd ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeRmd(!includeRmd)}>
+                {includeRmd ? "Estimated below ✓" : "Not estimated — tap to add"}
+              </button>
+            </div>
+            {includeRmd && (
+              rmdTable.length === 0 ? (
+                <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — you're not projected to be 73+ within this plan.</div>
+              ) : (
+                <>
+                <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                  <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                    <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Traditional bal.</span><span style={{ flex: 2, textAlign: "right" }}>Required RMD</span><span style={{ flex: 2, textAlign: "right" }}>Planned withdrawal</span><span style={{ flex: 2, textAlign: "right" }}>Shortfall</span>
+                  </div>
+                  {rmdTable.map((r) => (
+                    <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                      <span style={{ flex: 1 }}>{r.age}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.traditionalBalance)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.requiredRmd)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.plannedTraditionalWithdrawal)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: r.shortfall > 0 ? RUST : TEAL }}>{r.shortfall > 0 ? fmtMoney(r.shortfall) : "none"}</span>
+                    </div>
+                  ))}
+                </div>
+                {rmdTable.some((r) => r.shortfall > 0) && (
+                  <div style={{ fontSize: "12px", color: RUST, marginBottom: "10px" }}>
+                    One or more years show a shortfall — your withdrawal rate under-draws Traditional accounts relative to what the IRS requires at that age.
+                  </div>
+                )}
+                </>
+              )
+            )}
+            <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+              Uses the IRS Uniform Lifetime Table (unchanged since 2022). Real multi-IRA households can aggregate
+              RMDs across IRAs and take the total from just one, but 401k RMDs must be taken separately per plan —
+              not modeled here. "Traditional balance" and "planned withdrawal" both use the same account-mix
+              approximation as the After-Tax and IRMAA sections, not a tracked per-account balance.
+            </div>
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("irmaa")}>
+              <span>MEDICARE IRMAA — HIGH-INCOME SURCHARGE (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.irmaa ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.irmaa && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Medicare isn't flat-rate once you're on it: if your MAGI (Modified Adjusted Gross Income) runs high
+              enough, Part B and Part D premiums step up in tiers — this is IRMAA (Income-Related Monthly Adjustment
+              Amount). It's a cliff, not a smooth curve — $1 over a threshold triggers the whole next tier's surcharge.
+              It's also based on MAGI from <strong style={{ color: PARCHMENT }}>two years earlier</strong> (2026
+              premiums are set by 2024 income), so a single high-withdrawal year can raise your premium two years
+              later even after you've scaled back.
+            </div>
+
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeIrmaa ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeIrmaa(!includeIrmaa)}>
+                {includeIrmaa ? "Estimated below ✓" : "Not estimated — tap to add"}
+              </button>
+            </div>
+
+            {includeIrmaa && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Filing status</span>
+                    <div style={{ display: "flex" }}>
+                      <button className={`rr-toggle ${taxFilingStatus === "single" ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setTaxFilingStatus("single")}>Single</button>
+                      <button className={`rr-toggle ${taxFilingStatus === "joint" ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setTaxFilingStatus("joint")}>Married, joint</button>
+                    </div>
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">People on Medicare</span>
+                    <div style={{ display: "flex" }}>
+                      <button className={`rr-toggle ${Number(irmaaPeopleOnMedicare) === 1 ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setIrmaaPeopleOnMedicare(1)}>1</button>
+                      <button className={`rr-toggle ${Number(irmaaPeopleOnMedicare) === 2 ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIrmaaPeopleOnMedicare(2)}>2</button>
+                    </div>
+                  </div>
+                </div>
+
+                {irmaaTable.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — you're not projected to be 65+ within this plan.</div>
+                ) : (
+                  <>
+                  <div style={{ border: `1px solid ${irmaaTable[0].tier.label === "Standard" ? GRID : RUST}`, borderRadius: "4px", padding: "12px", marginBottom: "14px", background: PANEL_2 }}>
+                    <div className="rr-field-label">At age {irmaaTable[0].age} (first Medicare year)</div>
+                    <div className="rr-serif" style={{ fontSize: "22px", fontWeight: 700, color: irmaaTable[0].tier.label === "Standard" ? TEAL : RUST }}>
+                      {irmaaTable[0].tier.label === "Standard" ? "Standard premium — no surcharge" : `${irmaaTable[0].tier.label}: +${fmtMoney(irmaaTable[0].extraMonthly)}/mo`}
+                    </div>
+                    <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>
+                      Projected MAGI ≈ {fmtMoney(irmaaTable[0].magi)}/yr. Standard Part B alone is {fmtMoney(IRMAA_STANDARD_PART_B)}/mo per person in 2026.
+                    </div>
+                  </div>
+
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 2 }}>Tier</span><span style={{ flex: 2, textAlign: "right" }}>Extra/mo</span>
+                    </div>
+                    {irmaaTable.map((r) => (
+                      <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 1 }}>{r.age}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magi)}</span>
+                        <span style={{ flex: 2, color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.tier.label}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: r.tier.label === "Standard" ? TEAL : RUST }}>{r.extraMonthly > 0 ? fmtMoney(r.extraMonthly) : "$0"}</span>
+                      </div>
+                    ))}
+                  </div>
+                  </>
+                )}
+
+                <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+                  Estimate only, using 2026 published brackets (these adjust most years) and this year's projected
+                  withdrawal mix as a stand-in for the real two-years-prior lookback. Married filing separately has
+                  its own, much steeper two-tier structure not modeled here. This surcharge is{" "}
+                  <strong style={{ color: PARCHMENT }}>not</strong> automatically folded into your target or budget
+                  above — if you want it reflected there, add the extra monthly amount to "Healthcare, after Medicare
+                  (65+)" in your Annual Budget.
+                </div>
+              </>
+            )}
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("niit")}>
+              <span>NIIT — NET INVESTMENT INCOME TAX (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.niit ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.niit && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              A flat 3.8% surtax on investment income (capital gains, dividends, interest) once your MAGI clears
+              ${(NIIT_THRESHOLD.single / 1000).toFixed(0)}k single / ${(NIIT_THRESHOLD.joint / 1000).toFixed(0)}k married joint — fixed by statute since 2013, not
+              inflation-indexed. Unlike IRMAA/RMDs it isn't age-gated; it applies any year the threshold is cleared.
+              Traditional withdrawals and Social Security are specifically excluded from NII — this only touches the
+              gains portion of taxable-brokerage withdrawals in this tool's model.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeNiit ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeNiit(!includeNiit)}>
+                {includeNiit ? "Estimated below ✓" : "Not estimated — tap to add"}
+              </button>
+            </div>
+            {includeNiit && (
+              niitTable.length === 0 ? (
+                <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show yet — add accounts and set a retirement age above.</div>
+              ) : (
+                <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                  <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                    <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Est. MAGI</span><span style={{ flex: 2, textAlign: "right" }}>Net inv. income</span><span style={{ flex: 2, textAlign: "right" }}>NIIT owed</span>
+                  </div>
+                  {niitTable.map((r) => (
+                    <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                      <span style={{ flex: 1 }}>{r.age}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.magi)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.nii)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: r.niitOwed > 0 ? RUST : TEAL }}>{r.niitOwed > 0 ? fmtMoney(r.niitOwed) : "$0"}</span>
+                    </div>
+                  ))}
+                </div>
+              )
+            )}
+            <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
+              Filing status is shared with the IRMAA section above. This is on top of, not instead of, ordinary
+              capital gains tax already shown in After-Tax Withdrawals — the two aren't the same tax.
+            </div>
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
             <button className="rr-collapsible-header" onClick={() => toggle("smile")}>
               <span>SPENDING GLIDE PATH — RESEARCH-BASED</span>
               <span className="rr-caret" style={{ transform: expanded.smile ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
@@ -1683,6 +2218,9 @@ function RetirementRunwayV4() {
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Withdrawal income (after-tax est.)</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{fmtMoney(dv(afterTaxBreakdown.netAfterTax, Number(retireAge)))}/yr</td></tr>
             {includeSS && (
               <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Est. Social Security (claim age {ssClaimAge})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{fmtMoney(ssMonthly)}/mo</td></tr>
+            )}
+            {includeIrmaa && irmaaTable.length > 0 && (
+              <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Est. Medicare IRMAA surcharge (age {irmaaTable[0].age})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{irmaaTable[0].tier.label === "Standard" ? "none" : `+${fmtMoney(irmaaTable[0].extraMonthly)}/mo`}</td></tr>
             )}
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Earliest FIRE age</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{earliestFireAge || `${horizonAge}+`}</td></tr>
             <tr><td style={{ padding: "6px 0", borderBottom: "1px solid #eee" }}>Coast FIRE age (for retiring at {retireAge})</td><td style={{ padding: "6px 0", borderBottom: "1px solid #eee", textAlign: "right" }}>{coastFireAge !== null ? coastFireAge : `not by ${retireAge}`}</td></tr>
