@@ -942,16 +942,40 @@ function RetirementRunwayV4() {
   // Account tax-treatment mix, approximated from current contribution proportions —
   // the calculator only tracks one blended portfolio balance, not per-account balances,
   // so this assumes the mix of money going in roughly matches the mix coming out.
+  // Approximates withdrawal/balance composition from current contribution mix — this tool tracks
+  // one blended balance, not per-account balances. Falls back in two stages when there's no $
+  // contribution to weight by (e.g. every account shows $0/mo, the default for a new account): first
+  // to weighting by account COUNT instead (so one Roth account correctly reads as 100% Roth, not 0%
+  // everything), then to an even 25/25/25/25 split only if there are no accounts at all. Without
+  // this, a $0-contribution setup would make roth+traditional+hsa+taxable sum to 0% instead of
+  // 100%, silently dropping the whole balance from every section that relies on this split
+  // (After-Tax, IRMAA, RMD, NIIT, ACA, Legacy) rather than just being an imprecise estimate.
   const accountMix = useMemo(() => {
-    const total = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) || 1;
-    const pct = (treatment) => accounts.filter((a) => a.treatment === treatment).reduce((s, a) => s + Number(a.monthly || 0), 0) / total;
-    return {
-      roth: pct("Roth (after-tax)"),
-      traditional: pct("Traditional (pre-tax)"),
-      hsa: pct("Triple tax-advantaged"),
-      taxable: pct("Taxable"),
-    };
+    const totalMonthly = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0);
+    if (totalMonthly > 0) {
+      const pct = (treatment) => accounts.filter((a) => a.treatment === treatment).reduce((s, a) => s + Number(a.monthly || 0), 0) / totalMonthly;
+      return {
+        roth: pct("Roth (after-tax)"),
+        traditional: pct("Traditional (pre-tax)"),
+        hsa: pct("Triple tax-advantaged"),
+        taxable: pct("Taxable"),
+      };
+    }
+    if (accounts.length > 0) {
+      const countPct = (treatment) => accounts.filter((a) => a.treatment === treatment).length / accounts.length;
+      return {
+        roth: countPct("Roth (after-tax)"),
+        traditional: countPct("Traditional (pre-tax)"),
+        hsa: countPct("Triple tax-advantaged"),
+        taxable: countPct("Taxable"),
+      };
+    }
+    return { roth: 0.25, traditional: 0.25, hsa: 0.25, taxable: 0.25 };
   }, [accounts]);
+
+  // Whether accountMix above had real $ contributions to weight by, vs. falling back to account
+  // count/type or an even split — surfaced as a caveat in sections that lean on accountMix heavily.
+  const accountMixIsEstimated = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) <= 0;
 
   // Part-time ("Barista FIRE") work window. If a start age earlier than retirement age is chosen,
   // it's floored at retirement age — working part-time before you've actually left your main job
@@ -1230,26 +1254,17 @@ function RetirementRunwayV4() {
   // sandbox below; "Optimal" is the worst-for-heirs-first waterfall.
   const legacyResult = useMemo(() => {
     if (!includeLegacy) return null;
-    // accountMix is derived from CURRENT CONTRIBUTION mix (see its own definition above) — it can sum
-    // to well under 100%, commonly exactly 0% if every account shows $0/mo (the default for a new
-    // account). Multiplying the starting buckets by a mix that doesn't sum to 1 would silently drop
-    // part of the portfolio instead of accounting for all of it, so normalize here, falling back to
-    // an even split when there's no contribution data to infer a composition from at all.
-    const rawMixSum = LEGACY_BUCKET_KEYS.reduce((s, k) => s + (accountMix[k] || 0), 0);
-    const usingFallbackMix = rawMixSum <= 0;
-    const normalizedAccountMix = usingFallbackMix
-      ? { traditional: 0.25, hsa: 0.25, taxable: 0.25, roth: 0.25 }
-      : { traditional: accountMix.traditional / rawMixSum, hsa: accountMix.hsa / rawMixSum, taxable: accountMix.taxable / rawMixSum, roth: accountMix.roth / rawMixSum };
-
+    // accountMix is now guaranteed to sum to 1 (see its own definition above, which handles the
+    // no-contribution-data fallback) so it can be used directly here without re-normalizing.
     const common = {
-      portfolioAtRetirement: schedule.finalBalance, accountMix: normalizedAccountMix,
+      portfolioAtRetirement: schedule.finalBalance, accountMix,
       retireAge: Number(retireAge), horizonAge: Number(horizonAge),
       realPostReturn, withdrawalRate: Number(withdrawalRate), useSmile: useSpendingSmile,
     };
     const sumSplit = LEGACY_BUCKET_KEYS.reduce((s, k) => s + Math.max(Number(legacyWithdrawalSplit[k]) || 0, 0), 0) || 1;
     const normalizedSplit = {};
     LEGACY_BUCKET_KEYS.forEach((k) => { normalizedSplit[k] = (Math.max(Number(legacyWithdrawalSplit[k]) || 0, 0) / sumSplit) * 100; });
-    const statusQuoSplit = { traditional: normalizedAccountMix.traditional * 100, hsa: normalizedAccountMix.hsa * 100, taxable: normalizedAccountMix.taxable * 100, roth: normalizedAccountMix.roth * 100 };
+    const statusQuoSplit = { traditional: accountMix.traditional * 100, hsa: accountMix.hsa * 100, taxable: accountMix.taxable * 100, roth: accountMix.roth * 100 };
 
     const statusQuoBuckets = simulateLegacyBuckets({ ...common, mode: "split", splitPct: statusQuoSplit });
     const customBuckets = simulateLegacyBuckets({ ...common, mode: "split", splitPct: normalizedSplit });
@@ -1260,7 +1275,6 @@ function RetirementRunwayV4() {
       custom: legacyOutcome(customBuckets, estateState, Number(heirsMarginalRate)),
       optimal: legacyOutcome(optimalBuckets, estateState, Number(heirsMarginalRate)),
       normalizedSplit,
-      usingFallbackMix,
     };
   }, [includeLegacy, schedule.finalBalance, accountMix, retireAge, horizonAge, realPostReturn, withdrawalRate, useSpendingSmile, legacyWithdrawalSplit, estateState, heirsMarginalRate]);
 
@@ -2001,6 +2015,13 @@ function RetirementRunwayV4() {
                 <div style={{ fontSize: "11px", color: MUTED, marginTop: "2px" }}>{fmtMoney(dv(afterTaxBreakdown.netAfterTax, Number(retireAge)) / 12)}/mo</div>
               </div>
             </div>
+            {accountMixIsEstimated && (
+              <div style={{ fontSize: "11px", color: RUST, marginTop: "12px", lineHeight: 1.6 }}>
+                None of your accounts in "Your Accounts" show a monthly contribution, so the Roth/Traditional/HSA/
+                Taxable split above is estimated from account types instead of a real $ mix — add a monthly amount
+                there (even a rough one) for a more accurate breakdown.
+              </div>
+            )}
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "12px", lineHeight: 1.6 }}>
               Simplified estimate, not tax advice — real brackets, standard deductions, ACA subsidy cliffs (if retiring
               before 65), NIIT, and year-to-year account-mix choices all move this in practice.
@@ -2225,6 +2246,13 @@ function RetirementRunwayV4() {
                 )}
               </>
             )}
+            {accountMixIsEstimated && (
+              <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
+                None of your accounts in "Your Accounts" show a monthly contribution, so the MAGI estimate above is
+                based on account types instead of a real $ mix — add a monthly amount there (even a rough one) for a
+                more accurate estimate.
+              </div>
+            )}
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
               Uses 2026 federal poverty guidelines for the 48 contiguous states + DC (Alaska/Hawaii use higher bases,
               not modeled) and the reverted original ACA subsidy formula. Below 100% of FPL you likely don't qualify
@@ -2296,6 +2324,13 @@ function RetirementRunwayV4() {
                 </>
               )}
               </>
+            )}
+            {accountMixIsEstimated && (
+              <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
+                None of your accounts in "Your Accounts" show a monthly contribution, so "Traditional balance" above
+                is estimated from account types instead of a real $ mix — add a monthly amount there (even a rough
+                one) for a more accurate RMD estimate.
+              </div>
             )}
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
               Uses the IRS Uniform Lifetime Table (unchanged since 2022). Real multi-IRA households can aggregate
@@ -2380,6 +2415,13 @@ function RetirementRunwayV4() {
                   </>
                 )}
 
+                {accountMixIsEstimated && (
+                  <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
+                    None of your accounts in "Your Accounts" show a monthly contribution, so the Traditional/taxable
+                    portion of MAGI above is estimated from account types instead of a real $ mix — add a monthly
+                    amount there (even a rough one) for a more accurate MAGI estimate.
+                  </div>
+                )}
                 <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
                   Estimate only, using 2026 published brackets (these adjust most years) and this year's projected
                   withdrawal mix as a stand-in for the real two-years-prior lookback. Married filing separately has
@@ -2433,6 +2475,13 @@ function RetirementRunwayV4() {
                   ))}
                 </div>
               )
+            )}
+            {accountMixIsEstimated && (
+              <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
+                None of your accounts in "Your Accounts" show a monthly contribution, so the taxable/net-investment-
+                income portion above is estimated from account types instead of a real $ mix — add a monthly amount
+                there (even a rough one) for a more accurate estimate.
+              </div>
             )}
             <div style={{ fontSize: "11px", color: MUTED, marginTop: "10px", lineHeight: 1.6 }}>
               Filing status is shared with the IRMAA section above. This is on top of, not instead of, ordinary
@@ -2703,12 +2752,12 @@ function RetirementRunwayV4() {
                   </div>
                   </>
                 )}
-                {legacyResult && legacyResult.usingFallbackMix && (
+                {accountMixIsEstimated && (
                   <div style={{ fontSize: "11px", color: RUST, marginBottom: "10px", lineHeight: 1.6 }}>
-                    "Status quo" and the starting balance split above are assuming an even 25/25/25/25 split across
-                    account types — none of your accounts in "Your Accounts" show a monthly contribution to infer a
-                    composition from. Add a monthly amount (even a rough one) or set account types there for a more
-                    realistic starting point.
+                    None of your accounts in "Your Accounts" show a monthly contribution, so "Status quo" and the
+                    starting balance split above are estimated from account <em>types</em> instead (weighted evenly
+                    across whichever types you've added) rather than from a real $ mix. Add a monthly amount (even a
+                    rough one) there for a more realistic starting point.
                   </div>
                 )}
                 <div style={{ fontSize: "11px", color: MUTED, lineHeight: 1.6 }}>
