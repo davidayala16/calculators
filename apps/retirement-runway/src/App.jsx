@@ -342,6 +342,176 @@ function simulateDrawdownWithExtra({ portfolioAtRetirement, retireAge, horizonAg
   return val;
 }
 
+// Part-time ("Barista FIRE") income: gross income for a given age, growing at the same nominal
+// rate as the main salary raise setting (no separate growth input) — 0 outside the work window.
+// Clamped the same way spending/other loops are: negative/huge ages can't blow this up.
+function partTimeGrossIncome(age, ptStartAge, ptEndAge, ptIncomeAtStart, raisePct) {
+  if (ptStartAge === null || age < ptStartAge || age >= ptEndAge) return 0;
+  const yearsIn = Math.min(Math.max(age - ptStartAge, 0), MAX_YEARS);
+  return Math.min(ptIncomeAtStart * Math.pow(1 + raisePct / 100, yearsIn), MAX_BALANCE);
+}
+
+// Simulates the portfolio WITH part-time income folded in, for comparison against the baseline
+// (no-part-time) balance elsewhere. A constant % of gross part-time income is always contributed
+// back into the balance regardless of mode; the rest either offsets that year's withdrawal
+// (mode "offset" — same total spending, portfolio drawn down slower) or stacks on top of it
+// (mode "stack" — same withdrawal, more total spending money).
+function simulateDrawdownWithPartTime({ portfolioAtRetirement, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile, ptStartAge, ptEndAge, ptIncomeAtStart, raisePct, ptMode, ptContributionPct }) {
+  const monthlyRate = realPostReturn / 100 / 12;
+  let val = portfolioAtRetirement;
+  const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
+  const lastAge = retireAge + span;
+  let totalGrossIncome = 0;
+  for (let age = retireAge; age <= lastAge; age++) {
+    const smile = useSmile ? spendingSmileFactor(age) : 1;
+    const grossIncome = partTimeGrossIncome(age, ptStartAge, ptEndAge, ptIncomeAtStart, raisePct);
+    const contributionPortion = grossIncome * (ptContributionPct / 100);
+    const spendablePortion = grossIncome - contributionPortion;
+    totalGrossIncome += grossIncome;
+
+    const baseWithdrawal = val * (withdrawalRate / 100) * smile;
+    const withdrawalThisYear = ptMode === "offset" ? Math.max(baseWithdrawal - spendablePortion, 0) : baseWithdrawal;
+    const monthlyWithdrawal = withdrawalThisYear / 12;
+    const monthlyContribution = contributionPortion / 12;
+    for (let m = 0; m < 12; m++) {
+      val = Math.min(val * (1 + monthlyRate) - monthlyWithdrawal + monthlyContribution, MAX_BALANCE);
+      if (val < 0) val = 0;
+    }
+  }
+  return { endingBalance: val, totalGrossIncome };
+}
+
+// Legacy/estate planning: each account type is worth a different amount to a non-spouse heir.
+// Taxable brokerage gets a full step-up in cost basis at death (embedded gains vanish tax-free).
+// Roth IRA passes tax-free (heirs just owe a 10-year full-distribution window under SECURE Act).
+// Traditional 401k/IRA is taxed as ordinary income to the heir on withdrawal (also a 10-year window).
+// HSA is the worst: a non-spouse heir owes ordinary income tax on the FULL value immediately in the
+// year of death — no step-up, no 10-year spread. So "worst for heirs first" is HSA, then
+// Traditional, then Taxable/Roth (equivalent to each other for this purpose) preserved longest.
+const LEGACY_BUCKET_KEYS = ["traditional", "hsa", "taxable", "roth"];
+const LEGACY_OPTIMAL_ORDER = ["hsa", "traditional", "taxable", "roth"];
+
+// 2026 federal estate tax: OBBBA made the $15M-per-person exemption (indexed) permanent starting
+// 2026, up from the pre-OBBBA scheduled drop to roughly half that. Top rate 40%. Irrelevant for the
+// vast majority of retirement plans — shown mainly so the "why is this $0" question has an answer.
+const FEDERAL_ESTATE_EXEMPTION_2026 = 15000000;
+const FEDERAL_ESTATE_TOP_RATE = 0.4;
+function federalEstateTax(grossEstate) {
+  return Math.max(grossEstate - FEDERAL_ESTATE_EXEMPTION_2026, 0) * FEDERAL_ESTATE_TOP_RATE;
+}
+
+// State estate/inheritance tax, 2026. Estate-tax states apply their exemption/rate to the whole
+// estate; PA and NE instead levy an inheritance tax on the recipient — figures below are specifically
+// the rate for a child/lineal descendant (most inheritance-tax states, and most beneficiary classes
+// elsewhere, exempt children outright — NJ, KY, IA, MD's inheritance tax (separate from its estate
+// tax) all tax $0 to a child). Every other state, Texas included, has neither — $0.
+const STATE_ESTATE_TAX_2026 = {
+  TX: { label: "Texas — no estate/inheritance tax", exemption: Infinity, rate: 0 },
+  OTHER: { label: "Other state — no estate/inheritance tax", exemption: Infinity, rate: 0 },
+  CT: { label: "Connecticut", exemption: 15000000, rate: 0.12 },
+  HI: { label: "Hawaii", exemption: 5490000, rate: 0.2 },
+  IL: { label: "Illinois", exemption: 4000000, rate: 0.16 },
+  ME: { label: "Maine", exemption: 7160000, rate: 0.16 },
+  MD: { label: "Maryland", exemption: 5000000, rate: 0.16 },
+  MA: { label: "Massachusetts", exemption: 2000000, rate: 0.16 },
+  MN: { label: "Minnesota", exemption: 3000000, rate: 0.16 },
+  NY: { label: "New York", exemption: 6940000, rate: 0.16 },
+  OR: { label: "Oregon", exemption: 1000000, rate: 0.16 },
+  RI: { label: "Rhode Island", exemption: 1838056, rate: 0.16 },
+  VT: { label: "Vermont", exemption: 5000000, rate: 0.16 },
+  WA: { label: "Washington", exemption: 3000000, rate: 0.2 },
+  DC: { label: "Washington, DC", exemption: 4988400, rate: 0.16 },
+  PA: { label: "Pennsylvania (inheritance tax, child rate)", exemption: 0, rate: 0.045 },
+  NE: { label: "Nebraska (inheritance tax, immediate family)", exemption: 100000, rate: 0.01 },
+};
+function stateEstateTax(grossEstate, stateKey) {
+  const s = STATE_ESTATE_TAX_2026[stateKey] || STATE_ESTATE_TAX_2026.OTHER;
+  return Math.max(grossEstate - s.exemption, 0) * s.rate;
+}
+
+// Splits one withdrawal across the 4 buckets by weighted %, redistributing any shortfall from a
+// bucket that runs dry proportionally among the buckets that still have room — so a small bucket
+// draining early doesn't silently understate total spending. A few passes is always enough since
+// each pass either fully satisfies the need or drains at least one more bucket to zero.
+function drawBucketsBySplit(buckets, splitPct, amount) {
+  const remaining = { ...buckets };
+  let need = amount;
+  let guard = 0;
+  while (need > 0.01 && guard < 8) {
+    const active = LEGACY_BUCKET_KEYS.filter((k) => remaining[k] > 0 && splitPct[k] > 0);
+    const totalWeight = active.reduce((s, k) => s + splitPct[k], 0);
+    if (active.length === 0 || totalWeight <= 0) break; // nothing left to draw from
+    let shortfall = 0;
+    for (const k of active) {
+      const share = need * (splitPct[k] / totalWeight);
+      const take = Math.min(share, remaining[k]);
+      remaining[k] -= take;
+      shortfall += share - take;
+    }
+    need = shortfall;
+    guard++;
+  }
+  return remaining;
+}
+
+// Sequential waterfall draw: fully drains each bucket in `order` before touching the next.
+function drawBucketsByOrder(buckets, order, amount) {
+  const remaining = { ...buckets };
+  let need = amount;
+  for (const k of order) {
+    if (need <= 0) break;
+    const take = Math.min(need, remaining[k]);
+    remaining[k] -= take;
+    need -= take;
+  }
+  return remaining;
+}
+
+// Starts from the portfolio balance already projected at retirement, split into 4 buckets by the
+// same account-mix approximation used throughout this tool (contribution mix as a stand-in for
+// balance composition) — simulates only the drawdown phase, since that's the phase where "which
+// account do I draw from" is a meaningful choice at all.
+function simulateLegacyBuckets({ portfolioAtRetirement, accountMix, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile, mode, splitPct }) {
+  let buckets = {
+    traditional: portfolioAtRetirement * accountMix.traditional,
+    hsa: portfolioAtRetirement * accountMix.hsa,
+    taxable: portfolioAtRetirement * accountMix.taxable,
+    roth: portfolioAtRetirement * accountMix.roth,
+  };
+  const monthlyRate = realPostReturn / 100 / 12;
+  const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
+  const lastAge = retireAge + span;
+  for (let age = retireAge; age <= lastAge; age++) {
+    const smile = useSmile ? spendingSmileFactor(age) : 1;
+    const totalBalance = LEGACY_BUCKET_KEYS.reduce((s, k) => s + buckets[k], 0);
+    const annualWithdrawal = totalBalance * (withdrawalRate / 100) * smile;
+    const monthlyWithdrawal = annualWithdrawal / 12;
+    for (let m = 0; m < 12; m++) {
+      LEGACY_BUCKET_KEYS.forEach((k) => { buckets[k] = Math.min(buckets[k] * (1 + monthlyRate), MAX_BALANCE); });
+      buckets = mode === "optimal" ? drawBucketsByOrder(buckets, LEGACY_OPTIMAL_ORDER, monthlyWithdrawal) : drawBucketsBySplit(buckets, splitPct, monthlyWithdrawal);
+    }
+  }
+  return buckets;
+}
+
+// Estate tax comes off the top proportionally across all 4 buckets (a simplification — real estates
+// often pay estate tax from the residuary/liquid portion first, not pro-rata); heirs' own income tax
+// then further reduces only the Traditional/HSA portion, since Taxable/Roth pass income-tax-free.
+function legacyOutcome(buckets, estateState, heirsMarginalRate) {
+  const grossEstate = LEGACY_BUCKET_KEYS.reduce((s, k) => s + buckets[k], 0);
+  const fedTax = federalEstateTax(grossEstate);
+  const stTax = stateEstateTax(grossEstate, estateState);
+  const totalEstateTax = fedTax + stTax;
+  const estateTaxRatio = grossEstate > 0 ? Math.min(totalEstateTax / grossEstate, 1) : 0;
+  const heirRate = heirsMarginalRate / 100;
+  const netTraditional = buckets.traditional * (1 - estateTaxRatio) * (1 - heirRate);
+  const netHsa = buckets.hsa * (1 - estateTaxRatio) * (1 - heirRate);
+  const netTaxable = buckets.taxable * (1 - estateTaxRatio);
+  const netRoth = buckets.roth * (1 - estateTaxRatio);
+  const totalToHeirs = netTraditional + netHsa + netTaxable + netRoth;
+  return { buckets, grossEstate, fedTax, stTax, totalEstateTax, totalToHeirs };
+}
+
 function RetirementRunwayV4() {
   const [currentAge, setCurrentAge] = useState(30);
   const [uiMode, setUiMode] = useState("basic"); // "basic" | "advanced"
@@ -409,6 +579,17 @@ function RetirementRunwayV4() {
   const [survivorSsReductionPct, setSurvivorSsReductionPct] = useState(33);
   const [healthcareInflation, setHealthcareInflation] = useState(6);
   const [capGainsMode, setCapGainsMode] = useState("flat"); // "flat" | "bracket"
+  const [includePartTime, setIncludePartTime] = useState(false);
+  const [partTimeStartAge, setPartTimeStartAge] = useState(65);
+  const [fullRetirementAge, setFullRetirementAge] = useState(75);
+  const [partTimeIncome, setPartTimeIncome] = useState(20000);
+  const [partTimeMode, setPartTimeMode] = useState("offset"); // "offset" | "stack"
+  const [partTimeContributionPct, setPartTimeContributionPct] = useState(0);
+  const [includeLegacy, setIncludeLegacy] = useState(false);
+  const [heirsMarginalRate, setHeirsMarginalRate] = useState(22);
+  const [estateState, setEstateState] = useState("TX");
+  const [numberOfKids, setNumberOfKids] = useState(2);
+  const [legacyWithdrawalSplit, setLegacyWithdrawalSplit] = useState({ traditional: 25, hsa: 25, taxable: 25, roth: 25 });
 
   // Persistence: fully self-contained, no account or backend calls of any kind. Two layers:
   // a debounced localStorage autosave (this browser only, survives refresh/crash, no action
@@ -479,6 +660,17 @@ function RetirementRunwayV4() {
     if (p.survivorSsReductionPct !== undefined) setSurvivorSsReductionPct(p.survivorSsReductionPct);
     if (p.healthcareInflation !== undefined) setHealthcareInflation(p.healthcareInflation);
     if (p.capGainsMode !== undefined) setCapGainsMode(p.capGainsMode);
+    if (p.includePartTime !== undefined) setIncludePartTime(p.includePartTime);
+    if (p.partTimeStartAge !== undefined) setPartTimeStartAge(p.partTimeStartAge);
+    if (p.fullRetirementAge !== undefined) setFullRetirementAge(p.fullRetirementAge);
+    if (p.partTimeIncome !== undefined) setPartTimeIncome(p.partTimeIncome);
+    if (p.partTimeMode !== undefined) setPartTimeMode(p.partTimeMode);
+    if (p.partTimeContributionPct !== undefined) setPartTimeContributionPct(p.partTimeContributionPct);
+    if (p.includeLegacy !== undefined) setIncludeLegacy(p.includeLegacy);
+    if (p.heirsMarginalRate !== undefined) setHeirsMarginalRate(p.heirsMarginalRate);
+    if (p.estateState !== undefined) setEstateState(p.estateState);
+    if (p.numberOfKids !== undefined) setNumberOfKids(p.numberOfKids);
+    if (p.legacyWithdrawalSplit !== undefined) setLegacyWithdrawalSplit(p.legacyWithdrawalSplit);
   };
 
   const encodeProfile = (obj) => {
@@ -543,6 +735,8 @@ function RetirementRunwayV4() {
     includeRmd, includeNiit, includeAca, acaHouseholdSize, acaAnnualPremium,
     qcdAnnualAmount, includeLtc, ltcOnsetAge, ltcDurationYears, ltcCareType, ltcAnnualCost, ltcInsurancePremium,
     includeWidowTorpedo, survivorEventAge, survivorSsReductionPct, healthcareInflation, capGainsMode,
+    includePartTime, partTimeStartAge, fullRetirementAge, partTimeIncome, partTimeMode, partTimeContributionPct,
+    includeLegacy, heirsMarginalRate, estateState, numberOfKids, legacyWithdrawalSplit,
   };
 
   // Autosave to localStorage, debounced so rapid typing doesn't hit disk on every keystroke.
@@ -759,6 +953,16 @@ function RetirementRunwayV4() {
     };
   }, [accounts]);
 
+  // Part-time ("Barista FIRE") work window. If a start age earlier than retirement age is chosen,
+  // it's floored at retirement age — working part-time before you've actually left your main job
+  // is really "cut back my hours," a different scenario (lower the Salary input instead), not
+  // modeled here. Defined early since IRMAA/NIIT/ACA below all fold part-time income into MAGI.
+  const partTimeWindow = useMemo(() => {
+    const effectiveStart = Math.max(Number(partTimeStartAge), Number(retireAge));
+    const end = Number(fullRetirementAge);
+    return { start: effectiveStart, end, valid: end > effectiveStart };
+  }, [partTimeStartAge, retireAge, fullRetirementAge]);
+
   const afterTaxBreakdown = useMemo(() => {
     const gross = withdrawalAtRetirement;
     const rothAmt = gross * accountMix.roth;
@@ -811,12 +1015,13 @@ function RetirementRunwayV4() {
         const taxableAmt = annualWithdrawal * accountMix.taxable;
         const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
         const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
-        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt, 0);
+        const ptIncome = includePartTime ? partTimeGrossIncome(r.age, partTimeWindow.start, partTimeWindow.end, Number(partTimeIncome), Number(raisePct)) : 0;
+        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt + ptIncome, 0);
         const tier = findIrmaaTier(magi, taxFilingStatus);
         const extraMonthly = (tier.partBExtra + tier.partDExtra) * Number(irmaaPeopleOnMedicare);
         return { age: r.age, magi, tier, extraMonthly };
       });
-  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, irmaaPeopleOnMedicare, qcdAnnualAmount]);
+  }, [includeIrmaa, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, irmaaPeopleOnMedicare, qcdAnnualAmount, includePartTime, partTimeWindow, partTimeIncome, raisePct]);
 
   // Required Minimum Distributions: sampled every 5 years from age 73 on (same grid convention as
   // the IRMAA table above). "Traditional balance" and "planned Traditional withdrawal" are both the
@@ -859,12 +1064,13 @@ function RetirementRunwayV4() {
         const taxableAmt = annualWithdrawal * accountMix.taxable;
         const nii = taxableAmt * (Number(taxableGainsFraction) / 100); // net investment income ≈ the gains portion of taxable withdrawals
         const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
-        const magi = Math.max(traditionalAmt + nii + ssTaxableAmt, 0);
+        const ptIncome = includePartTime ? partTimeGrossIncome(r.age, partTimeWindow.start, partTimeWindow.end, Number(partTimeIncome), Number(raisePct)) : 0;
+        const magi = Math.max(traditionalAmt + nii + ssTaxableAmt + ptIncome, 0);
         const threshold = NIIT_THRESHOLD[taxFilingStatus] || NIIT_THRESHOLD.single;
         const niitOwed = NIIT_RATE * Math.max(Math.min(nii, magi - threshold), 0);
         return { age: r.age, magi, nii, niitOwed };
       });
-  }, [includeNiit, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, qcdAnnualAmount]);
+  }, [includeNiit, draw.rows, retireAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, taxFilingStatus, qcdAnnualAmount, includePartTime, partTimeWindow, partTimeIncome, raisePct]);
 
   // ACA subsidy cliff: only the pre-Medicare gap years matter here (retirement age through 64).
   // Requires a user-supplied premium estimate since this tool has no geographic/age-rated plan
@@ -884,7 +1090,8 @@ function RetirementRunwayV4() {
         const taxableAmt = annualWithdrawal * accountMix.taxable;
         const capGainsAmt = taxableAmt * (Number(taxableGainsFraction) / 100);
         const ssTaxableAmt = ssAnnual * (Number(ssTaxablePct) / 100);
-        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt, 0);
+        const ptIncome = includePartTime ? partTimeGrossIncome(r.age, partTimeWindow.start, partTimeWindow.end, Number(partTimeIncome), Number(raisePct)) : 0;
+        const magi = Math.max(traditionalAmt + capGainsAmt + ssTaxableAmt + ptIncome, 0);
         const fplPct = fplBase > 0 ? (magi / fplBase) * 100 : 0;
         const applicablePct = acaApplicablePct(fplPct);
         const cliff = applicablePct === null;
@@ -893,7 +1100,7 @@ function RetirementRunwayV4() {
         const netPremium = Number(acaAnnualPremium) - subsidy;
         return { age: r.age, magi, fplPct, cliff, subsidy, netPremium };
       });
-  }, [includeAca, draw.rows, retireAge, horizonAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, acaHouseholdSize, acaAnnualPremium]);
+  }, [includeAca, draw.rows, retireAge, horizonAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, acaHouseholdSize, acaAnnualPremium, includePartTime, partTimeWindow, partTimeIncome, raisePct]);
 
   // Roth conversion ladder: a bridge-to-59½ planning table, not tied to any new toggle state — it's
   // fully derived from inputs that already exist elsewhere (expense budget, inflation, tax rates).
@@ -973,6 +1180,89 @@ function RetirementRunwayV4() {
         return { age: r.age, magiAsSurvivor, tierIfJoint, tierAsSurvivor, extraIfJoint, extraAsSurvivor, torpedoDelta: extraAsSurvivor - extraIfJoint };
       });
   }, [includeWidowTorpedo, draw.rows, survivorEventAge, withdrawalRate, useSpendingSmile, includeSS, ssClaimAge, ssMonthly, accountMix, taxableGainsFraction, ssTaxablePct, survivorSsReductionPct, qcdAnnualAmount]);
+
+  // Compares ending balance with vs. without part-time income folded in — a parallel simulation,
+  // like the LTC comparison above, rather than altering the main chart/target so those numbers
+  // stay a pure reflection of "if I fully retire and never earn another dollar."
+  const partTimeComparison = useMemo(() => {
+    if (!includePartTime || !partTimeWindow.valid) return null;
+    const common = {
+      portfolioAtRetirement: schedule.finalBalance, retireAge: Number(retireAge), horizonAge: Number(horizonAge),
+      realPostReturn, withdrawalRate: Number(withdrawalRate), useSmile: useSpendingSmile,
+      raisePct: Number(raisePct), ptMode: partTimeMode, ptContributionPct: Number(partTimeContributionPct),
+    };
+    const withoutPartTime = simulateDrawdownWithPartTime({ ...common, ptStartAge: null, ptEndAge: null, ptIncomeAtStart: 0 });
+    const withPartTime = simulateDrawdownWithPartTime({ ...common, ptStartAge: partTimeWindow.start, ptEndAge: partTimeWindow.end, ptIncomeAtStart: Number(partTimeIncome) });
+    return {
+      withoutBalance: withoutPartTime.endingBalance,
+      withBalance: withPartTime.endingBalance,
+      impact: withPartTime.endingBalance - withoutPartTime.endingBalance,
+      totalGrossIncome: withPartTime.totalGrossIncome,
+    };
+  }, [includePartTime, partTimeWindow, schedule.finalBalance, retireAge, horizonAge, realPostReturn, withdrawalRate, useSpendingSmile, raisePct, partTimeMode, partTimeContributionPct, partTimeIncome]);
+
+  // Per-age breakdown, sampled every 5 years like the other tables. Uses the baseline (no-part-time)
+  // draw.rows balance as the reference point for each row rather than re-simulating a compounding
+  // alternate path row-by-row — an illustrative simplification, same convention already used by the
+  // IRMAA/RMD/NIIT/ACA tables above.
+  const partTimeTable = useMemo(() => {
+    if (!includePartTime || !partTimeWindow.valid) return [];
+    const firstAge = partTimeWindow.start;
+    const lastAge = Math.min(partTimeWindow.end - 1, Number(horizonAge));
+    if (firstAge > lastAge) return [];
+    return draw.rows
+      .filter((r) => r.age >= firstAge && r.age <= lastAge && (r.age === firstAge || (r.age - firstAge) % 5 === 0))
+      .map((r) => {
+        const smile = useSpendingSmile ? spendingSmileFactor(r.age) : 1;
+        const baseWithdrawal = r.balance * (Number(withdrawalRate) / 100) * smile;
+        const grossIncome = partTimeGrossIncome(r.age, partTimeWindow.start, partTimeWindow.end, Number(partTimeIncome), Number(raisePct));
+        const contributionPortion = grossIncome * (Number(partTimeContributionPct) / 100);
+        const spendablePortion = grossIncome - contributionPortion;
+        const withdrawalWithPartTime = partTimeMode === "offset" ? Math.max(baseWithdrawal - spendablePortion, 0) : baseWithdrawal;
+        const totalSpendingMoney = withdrawalWithPartTime + spendablePortion;
+        return { age: r.age, grossIncome, contributionPortion, baseWithdrawal, withdrawalWithPartTime, totalSpendingMoney };
+      });
+  }, [includePartTime, partTimeWindow, draw.rows, withdrawalRate, useSpendingSmile, partTimeIncome, raisePct, partTimeContributionPct, partTimeMode, horizonAge]);
+
+  // Legacy/estate: three parallel drawdown simulations sharing the same total withdrawal $ amount
+  // each year (so lifestyle is identical across all three) — only which accounts supply it differs.
+  // "Status quo" mirrors the blended-mix approximation used everywhere else; "Your split" is the
+  // sandbox below; "Optimal" is the worst-for-heirs-first waterfall.
+  const legacyResult = useMemo(() => {
+    if (!includeLegacy) return null;
+    // accountMix is derived from CURRENT CONTRIBUTION mix (see its own definition above) — it can sum
+    // to well under 100%, commonly exactly 0% if every account shows $0/mo (the default for a new
+    // account). Multiplying the starting buckets by a mix that doesn't sum to 1 would silently drop
+    // part of the portfolio instead of accounting for all of it, so normalize here, falling back to
+    // an even split when there's no contribution data to infer a composition from at all.
+    const rawMixSum = LEGACY_BUCKET_KEYS.reduce((s, k) => s + (accountMix[k] || 0), 0);
+    const usingFallbackMix = rawMixSum <= 0;
+    const normalizedAccountMix = usingFallbackMix
+      ? { traditional: 0.25, hsa: 0.25, taxable: 0.25, roth: 0.25 }
+      : { traditional: accountMix.traditional / rawMixSum, hsa: accountMix.hsa / rawMixSum, taxable: accountMix.taxable / rawMixSum, roth: accountMix.roth / rawMixSum };
+
+    const common = {
+      portfolioAtRetirement: schedule.finalBalance, accountMix: normalizedAccountMix,
+      retireAge: Number(retireAge), horizonAge: Number(horizonAge),
+      realPostReturn, withdrawalRate: Number(withdrawalRate), useSmile: useSpendingSmile,
+    };
+    const sumSplit = LEGACY_BUCKET_KEYS.reduce((s, k) => s + Math.max(Number(legacyWithdrawalSplit[k]) || 0, 0), 0) || 1;
+    const normalizedSplit = {};
+    LEGACY_BUCKET_KEYS.forEach((k) => { normalizedSplit[k] = (Math.max(Number(legacyWithdrawalSplit[k]) || 0, 0) / sumSplit) * 100; });
+    const statusQuoSplit = { traditional: normalizedAccountMix.traditional * 100, hsa: normalizedAccountMix.hsa * 100, taxable: normalizedAccountMix.taxable * 100, roth: normalizedAccountMix.roth * 100 };
+
+    const statusQuoBuckets = simulateLegacyBuckets({ ...common, mode: "split", splitPct: statusQuoSplit });
+    const customBuckets = simulateLegacyBuckets({ ...common, mode: "split", splitPct: normalizedSplit });
+    const optimalBuckets = simulateLegacyBuckets({ ...common, mode: "optimal", splitPct: null });
+
+    return {
+      statusQuo: legacyOutcome(statusQuoBuckets, estateState, Number(heirsMarginalRate)),
+      custom: legacyOutcome(customBuckets, estateState, Number(heirsMarginalRate)),
+      optimal: legacyOutcome(optimalBuckets, estateState, Number(heirsMarginalRate)),
+      normalizedSplit,
+      usingFallbackMix,
+    };
+  }, [includeLegacy, schedule.finalBalance, accountMix, retireAge, horizonAge, realPostReturn, withdrawalRate, useSpendingSmile, legacyWithdrawalSplit, estateState, heirsMarginalRate]);
 
   // Sequence-of-returns risk: same average return, different order — compare constant vs bad-years-first vs bad-years-last
   const [badYearsCount, setBadYearsCount] = useState(5);
@@ -1055,6 +1345,10 @@ function RetirementRunwayV4() {
     setIncludeLtc(false); setLtcOnsetAge(82); setLtcDurationYears(2); setLtcCareType("assistedLiving"); setLtcAnnualCost(74400); setLtcInsurancePremium(0);
     setIncludeWidowTorpedo(false); setSurvivorEventAge(80); setSurvivorSsReductionPct(33);
     setHealthcareInflation(6); setCapGainsMode("flat");
+    setIncludePartTime(false); setPartTimeStartAge(65); setFullRetirementAge(75); setPartTimeIncome(20000);
+    setPartTimeMode("offset"); setPartTimeContributionPct(0);
+    setIncludeLegacy(false); setHeirsMarginalRate(22); setEstateState("TX"); setNumberOfKids(2);
+    setLegacyWithdrawalSplit({ traditional: 25, hsa: 25, taxable: 25, roth: 25 });
     setUiMode("basic");
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
@@ -1068,6 +1362,7 @@ function RetirementRunwayV4() {
   const [expanded, setExpanded] = useState({
     budget: false, fire: false, tax: false, glossary: false, ss: false, order: false, sequence: false, limits: false, smile: false, afterTax: false, irmaa: false,
     rmd: false, niit: false, aca: false, rothLadder: false, ltc: false, widowTorpedo: false,
+    partTime: false, legacy: false,
     ageHorizon: true, salaryRaise: true, accountsPanel: true, returns: true, targetPortfolio: true, intro: true,
   });
   const toggle = (key) => setExpanded((prev) => ({ ...prev, [key]: !prev[key] }));
@@ -1770,6 +2065,114 @@ function RetirementRunwayV4() {
 
           {uiMode === "advanced" && (
           <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("partTime")}>
+              <span>PART-TIME WORK — "BARISTA FIRE" (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.partTime ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.partTime && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Plenty of people don't want a hard stop — some part-time income after leaving full-time work, for as
+              long as they want it. This models a work window between two ages, with income that grows the same
+              way your main salary does, and lets you choose whether that income reduces what you pull from the
+              portfolio (it lasts longer) or simply adds to your spending on top of your normal withdrawal.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includePartTime ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludePartTime(!includePartTime)}>
+                {includePartTime ? "Modeled below ✓" : "Not modeled — tap to add"}
+              </button>
+            </div>
+            {includePartTime && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Part-time work starts at age</span>
+                    <input type="number" value={partTimeStartAge} onChange={(e) => setPartTimeStartAge(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Full retirement (all work stops) at age</span>
+                    <input type="number" value={fullRetirementAge} onChange={(e) => setFullRetirementAge(e.target.value)} />
+                  </div>
+                </div>
+                {Number(partTimeStartAge) < Number(retireAge) && (
+                  <div style={{ fontSize: "11px", color: RUST, marginBottom: "14px", lineHeight: 1.6 }}>
+                    {partTimeStartAge} is before your retirement age ({retireAge}) — treating {partTimeStartAge} as
+                    "cut back my hours while still employed" isn't modeled here, so the work window below actually
+                    starts at {retireAge} instead. If you meant reducing hours at your current job, lower the
+                    "Current gross salary" field above instead.
+                  </div>
+                )}
+                <div style={{ marginBottom: "14px" }}>
+                  <span className="rr-field-label">Starting part-time income, $/yr</span>
+                  <input type="number" value={partTimeIncome} onChange={(e) => setPartTimeIncome(e.target.value)} />
+                  <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>
+                    Grows at {raisePct}%/yr — the same raise rate as your main salary setting above.
+                  </div>
+                </div>
+                <div style={{ marginBottom: "10px" }}>
+                  <span className="rr-field-label">What the income does</span>
+                  <div style={{ display: "flex" }}>
+                    <button className={`rr-toggle ${partTimeMode === "offset" ? "active" : ""}`} style={{ flex: 1, borderRight: "none" }} onClick={() => setPartTimeMode("offset")}>Reduce withdrawals</button>
+                    <button className={`rr-toggle ${partTimeMode === "stack" ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setPartTimeMode("stack")}>Stack on top</button>
+                  </div>
+                  <div style={{ fontSize: "11px", color: MUTED, marginTop: "6px", lineHeight: 1.6 }}>
+                    {partTimeMode === "offset"
+                      ? "Same total spending money either way — the portfolio just gets drawn down slower during the work window, since part-time income covers part of it instead."
+                      : "Withdrawal stays exactly as planned — part-time income is extra spending money on top, not a reduction in what you pull from the portfolio."}
+                  </div>
+                </div>
+                <div style={{ marginBottom: "18px" }}>
+                  <span className="rr-field-label">% of part-time income kept invested (rest is spending money)</span>
+                  <input type="number" min="0" max="100" value={partTimeContributionPct} onChange={(e) => setPartTimeContributionPct(e.target.value)} />
+                </div>
+
+                {partTimeComparison && (
+                  <div style={{ display: "flex", gap: "16px", marginBottom: "14px" }}>
+                    <div style={{ flex: 1, border: `1px solid ${GRID}`, borderRadius: "4px", padding: "12px" }}>
+                      <div className="rr-field-label">Balance at {horizonAge}, without part-time work</div>
+                      <div className="rr-serif" style={{ fontSize: "20px", fontWeight: 700 }}>{fmtMoney(partTimeComparison.withoutBalance)}</div>
+                    </div>
+                    <div style={{ flex: 1, border: `1px solid ${TEAL}`, borderRadius: "4px", padding: "12px" }}>
+                      <div className="rr-field-label">Balance at {horizonAge}, with part-time work</div>
+                      <div className="rr-serif" style={{ fontSize: "20px", fontWeight: 700, color: TEAL }}>{fmtMoney(partTimeComparison.withBalance)}</div>
+                      <div style={{ fontSize: "11px", color: MUTED, marginTop: "4px" }}>{partTimeComparison.impact >= 0 ? "+" : ""}{fmtMoney(partTimeComparison.impact)} vs. without</div>
+                    </div>
+                  </div>
+                )}
+
+                {partTimeTable.length === 0 ? (
+                  <div style={{ fontSize: "12px", color: MUTED, marginBottom: "10px" }}>Nothing to show — check that full retirement age is after the work start age.</div>
+                ) : (
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 1 }}>Age</span><span style={{ flex: 2, textAlign: "right" }}>Gross PT income</span><span style={{ flex: 2, textAlign: "right" }}>Withdrawal (no PT)</span><span style={{ flex: 2, textAlign: "right" }}>Withdrawal (with PT)</span><span style={{ flex: 2, textAlign: "right" }}>Total spending money</span>
+                    </div>
+                    {partTimeTable.map((r) => (
+                      <div key={r.age} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 1 }}>{r.age}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: TEAL }}>{fmtMoney(r.grossIncome)}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: MUTED }}>{fmtMoney(r.baseWithdrawal)}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(r.withdrawalWithPartTime)}</span>
+                        <span style={{ flex: 2, textAlign: "right", fontWeight: 600 }}>{fmtMoney(r.totalSpendingMoney)}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div style={{ fontSize: "11px", color: MUTED, lineHeight: 1.6 }}>
+                  Full gross part-time income counts as ordinary wages in the IRMAA/NIIT/ACA sections above and
+                  below, regardless of how much of it you keep invested vs. spend. This is a comparison simulation
+                  — it doesn't change the main chart or target above, so those stay a pure "fully retire and never
+                  earn another dollar" baseline.
+                </div>
+              </>
+            )}
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
             <button className="rr-collapsible-header" onClick={() => toggle("aca")}>
               <span>ACA SUBSIDY CLIFF — PRE-MEDICARE GAP (OPTIONAL)</span>
               <span className="rr-caret" style={{ transform: expanded.aca ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
@@ -2187,6 +2590,134 @@ function RetirementRunwayV4() {
                   Security here is approximated as a flat % reduction (this tool tracks one blended benefit, not two
                   separate spouses' benefits) rather than the real "keep the higher, lose the lower" rule. NIIT and
                   capital-gains bracket thresholds halve the same way at the same event, not shown separately here.
+                </div>
+              </>
+            )}
+            </>
+            )}
+          </div>
+          )}
+
+          {uiMode === "advanced" && (
+          <div style={{ marginTop: "30px" }}>
+            <button className="rr-collapsible-header" onClick={() => toggle("legacy")}>
+              <span>LEGACY &amp; ESTATE PLANNING (OPTIONAL)</span>
+              <span className="rr-caret" style={{ transform: expanded.legacy ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
+            </button>
+            {expanded.legacy && (
+            <>
+            <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
+              Each account type is worth a different amount to your kids, dollar for dollar. Taxable brokerage gets
+              a full step-up in cost basis at death — embedded gains vanish tax-free. Roth passes tax-free too
+              (heirs just have 10 years to fully withdraw it). Traditional 401k/IRA is taxed as ordinary income to
+              whoever inherits it. <strong style={{ color: PARCHMENT }}>HSA is the worst</strong> for a non-spouse
+              heir — taxed as ordinary income immediately, all at once, no step-up, no 10-year spread. Your total
+              spending stays exactly what you've already planned — this only changes <em>which accounts</em> supply
+              it, spending down Traditional/HSA first so more of what's left is the tax-efficient kind.
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: "10px", marginBottom: "14px" }}>
+              <button className={`rr-toggle ${includeLegacy ? "active" : ""}`} style={{ flex: 1 }} onClick={() => setIncludeLegacy(!includeLegacy)}>
+                {includeLegacy ? "Modeled below ✓" : "Not modeled — tap to add"}
+              </button>
+            </div>
+            {includeLegacy && (
+              <>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "14px" }}>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Heirs' income tax rate (on Traditional/HSA)</span>
+                    <input type="number" step="0.5" value={heirsMarginalRate} onChange={(e) => setHeirsMarginalRate(e.target.value)} />
+                  </div>
+                  <div style={{ flex: 1 }}>
+                    <span className="rr-field-label">Number of kids</span>
+                    <input type="number" min="1" value={numberOfKids} onChange={(e) => setNumberOfKids(e.target.value)} />
+                  </div>
+                </div>
+                <div style={{ marginBottom: "18px" }}>
+                  <span className="rr-field-label">State (estate/inheritance tax)</span>
+                  <select value={estateState} onChange={(e) => setEstateState(e.target.value)}>
+                    {Object.entries(STATE_ESTATE_TAX_2026).map(([key, s]) => (<option key={key} value={key}>{s.label}</option>))}
+                  </select>
+                </div>
+
+                <div className="rr-section-label" style={{ marginBottom: "10px" }}>TRY YOUR OWN WITHDRAWAL SPLIT</div>
+                <div style={{ fontSize: "11px", color: MUTED, marginBottom: "10px", lineHeight: 1.6 }}>
+                  What % of each year's withdrawal comes from each account type — doesn't need to add to 100%,
+                  it's normalized automatically.
+                </div>
+                <div style={{ display: "flex", gap: "10px", marginBottom: "18px", flexWrap: "wrap" }}>
+                  {LEGACY_BUCKET_KEYS.map((k) => (
+                    <div key={k} style={{ flex: "1 1 100px" }}>
+                      <span className="rr-field-label" style={{ textTransform: "capitalize" }}>{k}</span>
+                      <input
+                        type="number" min="0"
+                        value={legacyWithdrawalSplit[k]}
+                        onChange={(e) => setLegacyWithdrawalSplit((prev) => ({ ...prev, [k]: e.target.value }))}
+                      />
+                    </div>
+                  ))}
+                </div>
+
+                {legacyResult && (
+                  <>
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "14px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>Strategy</span><span style={{ flex: 2, textAlign: "right" }}>Est. tax at death</span><span style={{ flex: 2, textAlign: "right" }}>To your kids</span><span style={{ flex: 2, textAlign: "right" }}>Per kid ({numberOfKids})</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>Status quo (blended mix)</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(legacyResult.statusQuo.totalEstateTax)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(legacyResult.statusQuo.totalToHeirs)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(legacyResult.statusQuo.totalToHeirs / Math.max(Number(numberOfKids), 1))}</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>Your split</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(legacyResult.custom.totalEstateTax)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(legacyResult.custom.totalToHeirs)}</span>
+                      <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(legacyResult.custom.totalToHeirs / Math.max(Number(numberOfKids), 1))}</span>
+                    </div>
+                    <div className="rr-row rr-mono" style={{ fontSize: "13px", padding: "10px 12px", background: PANEL_2 }}>
+                      <span style={{ flex: 2, color: TEAL, fontWeight: 600 }}>Optimal (HSA → Traditional → Taxable/Roth)</span>
+                      <span style={{ flex: 2, textAlign: "right", color: RUST }}>{fmtMoney(legacyResult.optimal.totalEstateTax)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: TEAL, fontWeight: 600 }}>{fmtMoney(legacyResult.optimal.totalToHeirs)}</span>
+                      <span style={{ flex: 2, textAlign: "right", color: TEAL, fontWeight: 600 }}>{fmtMoney(legacyResult.optimal.totalToHeirs / Math.max(Number(numberOfKids), 1))}</span>
+                    </div>
+                  </div>
+
+                  <div className="rr-section-label" style={{ marginBottom: "10px" }}>OPTIMAL — ENDING BALANCE BY ACCOUNT AT {horizonAge}</div>
+                  <div style={{ border: `1px solid ${GRID}`, borderRadius: "4px", overflow: "hidden", marginBottom: "10px" }}>
+                    <div className="rr-row rr-mono" style={{ background: PANEL_2, fontSize: "11px", color: MUTED, textTransform: "uppercase", padding: "10px 12px" }}>
+                      <span style={{ flex: 2 }}>Account</span><span style={{ flex: 2, textAlign: "right" }}>Ending balance</span><span style={{ flex: 2, textAlign: "right" }}>To heirs, after tax</span>
+                    </div>
+                    {[
+                      ["Traditional", "traditional", legacyResult.optimal.buckets.traditional, legacyResult.optimal.buckets.traditional * (1 - Number(heirsMarginalRate) / 100)],
+                      ["HSA", "hsa", legacyResult.optimal.buckets.hsa, legacyResult.optimal.buckets.hsa * (1 - Number(heirsMarginalRate) / 100)],
+                      ["Taxable", "taxable", legacyResult.optimal.buckets.taxable, legacyResult.optimal.buckets.taxable],
+                      ["Roth", "roth", legacyResult.optimal.buckets.roth, legacyResult.optimal.buckets.roth],
+                    ].map(([label, key, bal, net]) => (
+                      <div key={key} className="rr-row rr-mono" style={{ fontSize: "13px", padding: "9px 12px" }}>
+                        <span style={{ flex: 2 }}>{label}</span>
+                        <span style={{ flex: 2, textAlign: "right" }}>{fmtMoney(bal)}</span>
+                        <span style={{ flex: 2, textAlign: "right", color: TEAL }}>{fmtMoney(net)}</span>
+                      </div>
+                    ))}
+                  </div>
+                  </>
+                )}
+                {legacyResult && legacyResult.usingFallbackMix && (
+                  <div style={{ fontSize: "11px", color: RUST, marginBottom: "10px", lineHeight: 1.6 }}>
+                    "Status quo" and the starting balance split above are assuming an even 25/25/25/25 split across
+                    account types — none of your accounts in "Your Accounts" show a monthly contribution to infer a
+                    composition from. Add a monthly amount (even a rough one) or set account types there for a more
+                    realistic starting point.
+                  </div>
+                )}
+                <div style={{ fontSize: "11px", color: MUTED, lineHeight: 1.6 }}>
+                  All three rows spend the exact same total dollar amount every year — only which account supplies
+                  it differs, so your lifestyle is identical across all three. Starting bucket balances use the
+                  same account-mix approximation as the After-Tax/IRMAA sections (contribution mix as a stand-in
+                  for balance composition), not a tracked per-account balance. Estate tax is applied pro-rata
+                  across accounts, a simplification — real estates often pay it from the residuary/liquid portion
+                  first. Not tax or estate-planning advice; consult a professional for anything at this scale.
                 </div>
               </>
             )}
