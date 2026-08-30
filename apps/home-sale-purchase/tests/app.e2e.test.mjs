@@ -209,12 +209,18 @@ test('"Start fresh" resets the autosave back to defaults', { timeout: TEST_TIMEO
   await page.click('button:has-text("Start fresh")');
   await page.waitForTimeout(700);
 
+  // Checked before any reload: the click clears the save immediately (see skipNextSave in
+  // App.jsx) rather than leaving the stale 999000 entry until some later edit overwrites it.
+  const savedRightAfterReset = await page.evaluate(() => localStorage.getItem('home-sale-purchase:autosave-v1'));
+  assert.equal(savedRightAfterReset, null, 'autosave key should be cleared immediately by Start fresh');
+
+  // A reload re-mounts the app, which re-autosaves whatever's currently showing (the defaults,
+  // in this case) after its own debounce — same behavior as retirement-runway/rent-vs-buy. The
+  // meaningful guarantee is that the *value* is back to default, not that the key stays absent
+  // forever through a subsequent full remount.
   await page.reload({ waitUntil: 'networkidle' });
   const value = await page.locator('input[type="number"]').nth(0).inputValue();
   assert.equal(value, '500000', 'sale price should be back to its default after Start fresh + reload');
-
-  const saved = await page.evaluate(() => localStorage.getItem('home-sale-purchase:autosave-v1'));
-  assert.equal(saved, null, 'autosave key should be cleared, not just overwritten with defaults');
 
   await context.close();
   await browser.close();
