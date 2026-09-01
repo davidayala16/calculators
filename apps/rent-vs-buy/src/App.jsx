@@ -271,17 +271,19 @@ function RentVsBuyCalculator() {
         input[type="number"], input[type="text"] {
           background: ${PANEL_2}; border: 1px solid ${GRID}; color: ${PARCHMENT};
           border-radius: 3px; padding: 7px 9px; font-family: 'IBM Plex Mono', monospace;
-          font-size: 13px; width: 100%; box-sizing: border-box;
+          font-size: 16px; width: 100%; box-sizing: border-box;
         }
         input:focus { outline: none; border-color: ${BUY}; }
-        .rvb-toggle { border: 1px solid ${GRID}; background: transparent; color: ${MUTED}; padding: 8px 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; cursor: pointer; }
+        /* min-height keeps every tappable control near the ~44px touch-target guideline even
+           where a call site's own inline padding/font-size is smaller. */
+        .rvb-toggle { border: 1px solid ${GRID}; background: transparent; color: ${MUTED}; padding: 8px 12px; font-family: 'IBM Plex Mono', monospace; font-size: 12px; cursor: pointer; min-height: 44px; display: inline-flex; align-items: center; justify-content: center; }
         .rvb-toggle.active { background: ${BUY}; border-color: ${BUY}; color: ${INK}; font-weight: 600; }
         .rvb-field-label { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: ${MUTED}; }
         .rvb-section-label { font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .1em; color: ${MUTED}; margin-bottom: 12px; }
         .rvb-collapsible-header {
           font-family: 'IBM Plex Mono', monospace; font-size: 11px; letter-spacing: .1em; color: ${MUTED};
           margin-bottom: 12px; cursor: pointer; display: flex; align-items: center; justify-content: space-between;
-          background: transparent; border: none; width: 100%; padding: 0; text-align: left;
+          background: transparent; border: none; width: 100%; padding: 0; text-align: left; min-height: 44px;
         }
         .rvb-collapsible-header:hover { color: ${BUY}; }
         .rvb-caret { font-size: 10px; transition: transform 0.15s ease; }
@@ -291,8 +293,8 @@ function RentVsBuyCalculator() {
         .rvb-slider-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; flex-wrap: wrap; gap: 6px; }
         .rvb-slider-input-group { display: flex; align-items: center; gap: 4px; }
         .rvb-slider-number {
-          width: 92px; text-align: right; background: ${PANEL_2}; border: 1px solid ${GRID}; color: ${PARCHMENT};
-          border-radius: 3px; padding: 5px 7px; font-family: 'IBM Plex Mono', monospace; font-size: 13px; font-weight: 600;
+          width: 104px; text-align: right; background: ${PANEL_2}; border: 1px solid ${GRID}; color: ${PARCHMENT};
+          border-radius: 3px; padding: 5px 7px; font-family: 'IBM Plex Mono', monospace; font-size: 16px; font-weight: 600;
         }
         .rvb-slider-number:focus { outline: none; border-color: ${BUY}; }
         .rvb-slider-adornment { font-size: 13px; color: ${MUTED}; font-weight: 600; }
@@ -325,7 +327,7 @@ function RentVsBuyCalculator() {
 
         {shareUrlDisplay && (
           <div style={{ border: `1px solid ${BUY}`, borderRadius: "4px", padding: "10px", marginBottom: "14px", background: PANEL_2, display: "flex", gap: "8px", alignItems: "center" }}>
-            <input readOnly value={shareUrlDisplay} onFocus={(e) => e.target.select()} className="rvb-mono" style={{ flex: 1, fontSize: "11px" }} />
+            <input readOnly value={shareUrlDisplay} onFocus={(e) => e.target.select()} className="rvb-mono" style={{ flex: 1, fontSize: "16px", minWidth: 0 }} />
             <button className="rvb-toggle" style={{ fontSize: "11px", padding: "6px 10px", flexShrink: 0 }} onClick={() => setShareUrlDisplay(null)}>Close</button>
           </div>
         )}
