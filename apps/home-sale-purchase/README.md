@@ -8,7 +8,10 @@ buyer closing costs, PMI, discount points, fixed or ARM loans) together,
 then compares the resulting new monthly payment against what you pay
 today. Includes side-by-side rate scenarios, a full rate sensitivity
 grid, year-by-year amortization for both loans, an equity-over-time
-chart, and a discount-points breakeven estimate.
+chart, a discount-points breakeven estimate, and an affordability panel
+that turns your household income into a max qualifying home price (or
+the reverse: the income a target price would require) under standard
+front-end/back-end debt-to-income limits.
 
 Everything is self-contained in the browser — inputs are encoded into a
 shareable URL (`?d=...`) rather than stored on any backend, so there's no
