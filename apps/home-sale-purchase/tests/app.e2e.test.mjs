@@ -78,13 +78,13 @@ test('sweeps every numeric input with extreme values, across both timing modes, 
   await page.click('button:has-text("Buy before selling")');
   await page.waitForTimeout(150);
   let count = await page.locator('input[type="number"]').count();
-  assert.ok(count >= 25, `expected most numeric inputs to be mounted after expanding everything, got ${count}`);
+  assert.ok(count >= 34, `expected most numeric inputs to be mounted after expanding everything, got ${count}`);
   await sweepAllNumberInputs(page, errors, 'buy-before-sell');
 
   await page.click('button:has-text("Sell, then buy")');
   await page.waitForTimeout(150);
   count = await page.locator('input[type="number"]').count();
-  assert.ok(count >= 20, `expected numeric inputs to remain mounted in sell-then-buy mode, got ${count}`);
+  assert.ok(count >= 32, `expected numeric inputs to remain mounted in sell-then-buy mode, got ${count}`);
   await sweepAllNumberInputs(page, errors, 'sell-then-buy');
 
   await context.close();
@@ -138,6 +138,52 @@ test('reproduces transient bad states: underwater equity mid-edit and rapid timi
 
   assert.equal(await isShowingErrorBoundary(page), false, 'app crashed during multi-field editing');
   assert.deepEqual(errors, [], 'no console/page errors during multi-field editing');
+
+  await context.close();
+  await browser.close();
+});
+
+test('affordability: zero income/DTI and back to normal without crashing or showing NaN/Infinity', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+  await expandEverything(page);
+
+  const fieldInput = (label) =>
+    page.locator('div').filter({ has: page.locator('span.hsp-field-label', { hasText: label }) }).locator('input').first();
+
+  const grossIncomeInput = fieldInput('Household gross annual income');
+  const frontEndInput = fieldInput('Max front-end DTI');
+  const backEndInput = fieldInput('Max back-end DTI');
+
+  // Zero income and zero DTI limits at once — a normal mid-edit state (e.g. clearing a field to
+  // retype it) that the affordability math must floor to 0, not divide-by-zero into NaN/Infinity.
+  await retype(grossIncomeInput, 0);
+  await page.waitForTimeout(150);
+  await retype(frontEndInput, 0);
+  await page.waitForTimeout(150);
+  await retype(backEndInput, 0);
+  await page.waitForTimeout(150);
+
+  assert.equal(await isShowingErrorBoundary(page), false, 'app crashed with zero income/DTI');
+  let bodyText = await page.locator('body').innerText();
+  assert.ok(!bodyText.includes('NaN'), 'affordability panel should never render NaN');
+  assert.ok(!bodyText.includes('Infinity'), 'affordability panel should never render Infinity');
+
+  await retype(grossIncomeInput, 150000);
+  await page.waitForTimeout(150);
+  await retype(frontEndInput, 28);
+  await page.waitForTimeout(150);
+  await retype(backEndInput, 36);
+  await page.waitForTimeout(150);
+
+  assert.equal(await isShowingErrorBoundary(page), false, 'app crashed restoring normal income/DTI');
+  bodyText = await page.locator('body').innerText();
+  assert.ok(!bodyText.includes('NaN'), 'affordability panel should never render NaN after recovery');
+  assert.deepEqual(errors, [], 'no console/page errors during affordability edge-case editing');
 
   await context.close();
   await browser.close();

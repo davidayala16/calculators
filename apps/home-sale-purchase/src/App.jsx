@@ -6,6 +6,7 @@ import {
   computeSellingProceeds, computeFundsAvailable, computeBuySide, computeOldMonthlyPayment,
   computeBridgeCarryCost, computeGapHousingCost, computeRateScenarios, computeRateSensitivityTable,
   computePointsBreakeven, computeEquityOverTime, estimatePmiRemovalYear, buildAmortization,
+  computeMaxAffordablePrice, computeRequiredIncome, computeActualDti,
 } from './model.js';
 
 const INK = "#12141C";
@@ -50,6 +51,9 @@ const DEFAULTS = {
   homeAppreciationPct: 3.5, comparisonYears: 10,
   // Rate sensitivity grid
   sensMinRate: 5, sensMaxRate: 8.5, sensStep: 0.5,
+  // Income & affordability
+  grossAnnualIncome: 150000, netAnnualIncome: 112000, otherMonthlyDebts: 400,
+  frontEndDtiPct: 28, backEndDtiPct: 36,
 };
 
 function CollapsibleHeader({ label, expandedKey, expanded, toggle }) {
@@ -118,9 +122,15 @@ function HomeSalePurchaseCalculator() {
   const [sensMinRate, setSensMinRate] = useState(DEFAULTS.sensMinRate);
   const [sensMaxRate, setSensMaxRate] = useState(DEFAULTS.sensMaxRate);
   const [sensStep, setSensStep] = useState(DEFAULTS.sensStep);
+  // Income & affordability
+  const [grossAnnualIncome, setGrossAnnualIncome] = useState(DEFAULTS.grossAnnualIncome);
+  const [netAnnualIncome, setNetAnnualIncome] = useState(DEFAULTS.netAnnualIncome);
+  const [otherMonthlyDebts, setOtherMonthlyDebts] = useState(DEFAULTS.otherMonthlyDebts);
+  const [frontEndDtiPct, setFrontEndDtiPct] = useState(DEFAULTS.frontEndDtiPct);
+  const [backEndDtiPct, setBackEndDtiPct] = useState(DEFAULTS.backEndDtiPct);
 
   const [expanded, setExpanded] = useState({
-    oldHome: true, selling: true, newHome: true, loan: true,
+    oldHome: true, selling: true, newHome: true, loan: true, income: true,
     timing: false, appreciation: false, rateScenarios: true, sensitivity: false, sensitivityTable: false,
     amortization: false, equity: true, about: false,
   });
@@ -172,6 +182,11 @@ function HomeSalePurchaseCalculator() {
     if (p.sensMinRate !== undefined) setSensMinRate(p.sensMinRate);
     if (p.sensMaxRate !== undefined) setSensMaxRate(p.sensMaxRate);
     if (p.sensStep !== undefined) setSensStep(p.sensStep);
+    if (p.grossAnnualIncome !== undefined) setGrossAnnualIncome(p.grossAnnualIncome);
+    if (p.netAnnualIncome !== undefined) setNetAnnualIncome(p.netAnnualIncome);
+    if (p.otherMonthlyDebts !== undefined) setOtherMonthlyDebts(p.otherMonthlyDebts);
+    if (p.frontEndDtiPct !== undefined) setFrontEndDtiPct(p.frontEndDtiPct);
+    if (p.backEndDtiPct !== undefined) setBackEndDtiPct(p.backEndDtiPct);
   };
 
   const profileSnapshot = {
@@ -183,6 +198,7 @@ function HomeSalePurchaseCalculator() {
     newMortgageRatePct, newLoanTermYears, loanType, armInitialPeriodYears, armPostAdjustRatePct, discountPoints,
     timingMode, gapMonths, tempHousingMonthly, bridgeLoanAmount, bridgeLoanRatePct, overlapMonths,
     homeAppreciationPct, comparisonYears, sensMinRate, sensMaxRate, sensStep,
+    grossAnnualIncome, netAnnualIncome, otherMonthlyDebts, frontEndDtiPct, backEndDtiPct,
   };
 
   const encodeProfile = (obj) => {
@@ -291,6 +307,12 @@ function HomeSalePurchaseCalculator() {
 
   const pmiRemovalYear = useMemo(() => estimatePmiRemovalYear(inputs, buySide), [inputs, buySide]);
 
+  const maxAffordable = useMemo(() => computeMaxAffordablePrice(inputs, downPayment), [inputs, downPayment]);
+
+  const requiredIncome = useMemo(() => computeRequiredIncome(buySide.totalMonthly, inputs), [inputs, buySide]);
+
+  const actualDti = useMemo(() => computeActualDti(inputs, buySide.totalMonthly), [inputs, buySide]);
+
   const oldAmort = useMemo(() => buildAmortization({
     loanAmount: oldPayment.balance, ratePct: oldPayment.rate, termYears: oldPayment.remainingYears,
     projectionYears: oldPayment.remainingYears,
@@ -359,8 +381,8 @@ function HomeSalePurchaseCalculator() {
         </h1>
         <p style={{ color: MUTED, fontSize: "14px", margin: 0, maxWidth: "640px" }}>
           Sell your current home, buy the next one, and see exactly how selling costs, your new
-          rate, and where the down payment comes from change your monthly payment versus what
-          you pay today.
+          rate, where the down payment comes from, and your income affect your monthly payment
+          and what home price you actually qualify for.
         </p>
         <p className="hsp-mono" style={{ color: MUTED, fontSize: "11px", margin: "10px 0 0 0", maxWidth: "640px", lineHeight: 1.6 }}>
           Autosaves in this browser as you go. Tap "Copy shareable link" to bookmark or send a specific scenario.
@@ -503,6 +525,28 @@ function HomeSalePurchaseCalculator() {
           )}
 
           <div style={{ marginTop: "22px" }}>
+            <CollapsibleHeader label="INCOME &amp; AFFORDABILITY" expandedKey="income" expanded={expanded} toggle={toggle} />
+          </div>
+          {expanded.income && (
+            <>
+              <Field label="Household gross annual income" value={grossAnnualIncome} onChange={setGrossAnnualIncome}
+                help="Before taxes. Used for the standard lender debt-to-income (DTI) limits below." />
+              <Field label="Household net annual income" value={netAnnualIncome} onChange={setNetAnnualIncome}
+                help="After taxes / take-home. Optional — used only for the plain '% of take-home pay' gut check, not the formal DTI ratios." />
+              <Field label="Other monthly debt payments" value={otherMonthlyDebts} onChange={setOtherMonthlyDebts} suffix="$/mo"
+                help="Car loans, student loans, credit cards, etc. — counts against the back-end DTI limit." />
+              <Field label="Max front-end DTI" value={frontEndDtiPct} onChange={setFrontEndDtiPct} suffix="% of gross"
+                help="Housing payment alone as a share of gross income. Conventional loans commonly cap this around 28%." />
+              <Field label="Max back-end DTI" value={backEndDtiPct} onChange={setBackEndDtiPct} suffix="% of gross"
+                help="Housing payment plus all other debts as a share of gross income. Commonly capped around 36-43%." />
+              <div className="hsp-card">
+                <div className="hsp-row"><span style={{ fontSize: "12px" }}>Max home price you qualify for</span><span className="hsp-mono" style={{ fontSize: "13px", fontWeight: 700, color: NEW }}>{fmtMoney(maxAffordable.maxHomePrice)}</span></div>
+                <div className="hsp-row"><span style={{ fontSize: "12px" }}>Gross income needed for your configured new home price</span><span className="hsp-mono" style={{ fontSize: "12px" }}>{fmtMoney(requiredIncome.requiredGrossAnnual)}/yr</span></div>
+              </div>
+            </>
+          )}
+
+          <div style={{ marginTop: "22px" }}>
             <CollapsibleHeader label="TIMING SCENARIO" expandedKey="timing" expanded={expanded} toggle={toggle} />
           </div>
           {expanded.timing && (
@@ -600,6 +644,39 @@ function HomeSalePurchaseCalculator() {
               <div className="hsp-row" style={{ borderTop: `1px solid ${GRID}`, marginTop: "6px", paddingTop: "10px" }}>
                 <span style={{ fontSize: "13px", fontWeight: 600 }}>{cashPositive ? "Left over" : "Shortfall"}</span>
                 <span className="hsp-mono" style={{ fontSize: "16px", fontWeight: 700, color: cashPositive ? NEW : DANGER }}>{fmtMoney(Math.abs(buySide.cashGap))}</span>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: "30px" }}>
+            <div className="hsp-section-label">AFFORDABILITY</div>
+            <div className="hsp-card">
+              <div className="hsp-row">
+                <span style={{ fontSize: "12px" }}>Max home price at your entered income &amp; DTI limits</span>
+                <span className="hsp-mono" style={{ fontSize: "13px", fontWeight: 700, color: NEW }}>{fmtMoney(maxAffordable.maxHomePrice)}</span>
+              </div>
+              <div style={{ fontSize: "11px", color: MUTED, padding: "0 0 8px" }}>
+                Binding limit: {maxAffordable.bindingConstraint === "front-end" ? "front-end (housing/gross income)" : "back-end (housing + debts/gross income)"} DTI,
+                {" "}using the {fmtMoney(downPayment)} down payment configured above.
+              </div>
+              <div className="hsp-row"><span style={{ fontSize: "12px" }}>Gross income needed for your configured {fmtMoney(newHomePrice)} price</span><span className="hsp-mono" style={{ fontSize: "12px" }}>{fmtMoney(requiredIncome.requiredGrossAnnual)}/yr</span></div>
+              <div className="hsp-row" style={{ borderTop: `1px solid ${GRID}`, marginTop: "6px", paddingTop: "10px" }}>
+                <span style={{ fontSize: "12px" }}>Front-end DTI at your entered income</span>
+                <span className="hsp-mono" style={{ fontSize: "12px", color: actualDti.frontEndActualPct !== null && actualDti.frontEndActualPct > frontEndDtiPct ? DANGER : PARCHMENT }}>
+                  {actualDti.frontEndActualPct !== null ? fmtPct(actualDti.frontEndActualPct, 1) : "— (enter gross income)"}
+                </span>
+              </div>
+              <div className="hsp-row">
+                <span style={{ fontSize: "12px" }}>Back-end DTI at your entered income</span>
+                <span className="hsp-mono" style={{ fontSize: "12px", color: actualDti.backEndActualPct !== null && actualDti.backEndActualPct > backEndDtiPct ? DANGER : PARCHMENT }}>
+                  {actualDti.backEndActualPct !== null ? fmtPct(actualDti.backEndActualPct, 1) : "— (enter gross income)"}
+                </span>
+              </div>
+              <div className="hsp-row">
+                <span style={{ fontSize: "12px" }}>Housing payment as % of take-home (net) pay</span>
+                <span className="hsp-mono" style={{ fontSize: "12px" }}>
+                  {actualDti.netHousingActualPct !== null ? fmtPct(actualDti.netHousingActualPct, 1) : "— (enter net income)"}
+                </span>
               </div>
             </div>
           </div>
@@ -739,6 +816,18 @@ function HomeSalePurchaseCalculator() {
                   plus property tax, homeowners insurance, HOA dues, and PMI where it applies —
                   compared directly against what you're paying today on the old mortgage under the
                   same categories.
+                </p>
+                <p>
+                  Affordability uses standard lender debt-to-income (DTI) limits: front-end (the
+                  housing payment alone, as a share of gross monthly income) and back-end (housing
+                  plus your other monthly debts, as a share of gross income) — whichever is more
+                  restrictive wins. The max home price search holds your configured down payment
+                  fixed and solves for the highest price whose payment (P&amp;I, tax, insurance,
+                  HOA, and PMI where it applies) still fits the tighter of the two limits. The
+                  required-income figure runs that the other direction: the minimum gross income
+                  that would let your currently configured new-home payment clear both limits. Net
+                  income (if entered) only drives the extra "% of take-home pay" line — a plain
+                  budget gut-check, not a lending ratio.
                 </p>
               </div>
             )}

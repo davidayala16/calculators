@@ -52,6 +52,8 @@ export async function launchBrowser() {
   return chromium.launch({ executablePath });
 }
 
+// INCOME & AFFORDABILITY is expanded by default (like YOUR CURRENT HOME, SELLING COSTS & TAXES,
+// THE NEW HOME, and LOAN OPTIONS above it), so it doesn't need to be opened here.
 const ALWAYS_OPEN_HEADERS = [
   'TIMING SCENARIO', 'APPRECIATION', 'RATE SENSITIVITY GRID SETTINGS',
   'FULL RATE SENSITIVITY TABLE', 'HOME EQUITY', 'AMORTIZATION SCHEDULE', 'HOW THIS IS CALCULATED',

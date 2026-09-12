@@ -295,6 +295,97 @@ export function computeEquityOverTime(inputs, buySide, years) {
   return rows;
 }
 
+export const MAX_AFFORDABILITY_ITERATIONS = 60;
+const AFFORDABILITY_PRICE_CEILING = 5e7; // no realistic home price exceeds this; keeps the search below bounded
+
+function clampDtiPct(v) {
+  return Math.min(Math.max(Number(v) || 0, 0), 100);
+}
+
+// All-in monthly housing cost at a candidate price, given a fixed down-payment dollar amount.
+// Property tax and PMI both scale with price (and PMI also depends on the down%, which itself
+// depends on price), so there's no closed-form inversion from a target payment back to a price —
+// this is the per-price cost function that solveMaxPriceForPayment below searches over.
+function monthlyHousingCostForPrice(price, downPayment, inputs) {
+  const loanAmount = Math.max(price - downPayment, 0);
+  const rate = Math.max(Number(inputs.newMortgageRatePct) || 0, 0);
+  const termYears = clampYears(inputs.newLoanTermYears) || 30;
+  const pAndI = computeMonthlyPayment(loanAmount, rate, termYears * 12);
+  const taxMonthly = (price * (pctOf(inputs.newPropertyTaxPct) / 100)) / 12;
+  const insuranceMonthly = pctOf(inputs.newHomeInsuranceAnnual) / 12;
+  const hoaMonthly = pctOf(inputs.newHoaMonthly);
+  const downPct = price > 0 ? (downPayment / price) * 100 : 100;
+  const pmiMonthly = downPct < 20 ? (loanAmount * (pctOf(inputs.pmiRatePct) / 100)) / 12 : 0;
+  return clampDollars(pAndI + taxMonthly + insuranceMonthly + hoaMonthly + pmiMonthly);
+}
+
+// Highest home price whose all-in monthly payment fits within `maxHousingPayment`, for a fixed
+// down-payment dollar amount. Binary search over a bounded price range converges in a fixed
+// number of iterations (MAX_AFFORDABILITY_ITERATIONS) regardless of input, which is what keeps
+// an extreme/malformed income or DTI input from ever driving an unbounded loop.
+export function solveMaxPriceForPayment(maxHousingPayment, downPayment, inputs) {
+  const budget = Math.max(Number(maxHousingPayment) || 0, 0);
+  const dp = Math.max(Number(downPayment) || 0, 0);
+  if (budget <= 0) return clampDollars(dp); // no affordable loan payment — most you can buy is your cash on hand
+  let lo = dp;
+  let hi = Math.max(dp, AFFORDABILITY_PRICE_CEILING);
+  if (monthlyHousingCostForPrice(hi, dp, inputs) <= budget) return clampDollars(hi);
+  for (let i = 0; i < MAX_AFFORDABILITY_ITERATIONS; i++) {
+    const mid = (lo + hi) / 2;
+    if (monthlyHousingCostForPrice(mid, dp, inputs) <= budget) lo = mid; else hi = mid;
+  }
+  return clampDollars(lo);
+}
+
+// Max home price a given gross income supports, under standard front-end (housing/gross) and
+// back-end (housing + other debts/gross) DTI limits — whichever constraint binds first, exactly
+// as a lender would qualify the loan.
+export function computeMaxAffordablePrice(inputs, downPayment) {
+  const grossMonthly = pctOf(inputs.grossAnnualIncome) / 12;
+  const otherMonthlyDebts = pctOf(inputs.otherMonthlyDebts);
+  const frontEndPct = clampDtiPct(inputs.frontEndDtiPct);
+  const backEndPct = clampDtiPct(inputs.backEndDtiPct);
+
+  const maxHousingFrontEnd = clampDollars(grossMonthly * (frontEndPct / 100));
+  const maxHousingBackEnd = clampDollars(Math.max(grossMonthly * (backEndPct / 100) - otherMonthlyDebts, 0));
+  const bindingConstraint = maxHousingFrontEnd <= maxHousingBackEnd ? "front-end" : "back-end";
+  const maxHousingPayment = Math.min(maxHousingFrontEnd, maxHousingBackEnd);
+  const maxHomePrice = solveMaxPriceForPayment(maxHousingPayment, downPayment, inputs);
+
+  return { grossMonthly, maxHousingFrontEnd, maxHousingBackEnd, maxHousingPayment, bindingConstraint, maxHomePrice };
+}
+
+// The mirror question: minimum gross income needed to qualify for a given monthly housing
+// payment under the same DTI limits. Closed-form (unlike the price search above) since income
+// scales linearly with the payment it supports.
+export function computeRequiredIncome(monthlyHousingPayment, inputs) {
+  const M = Math.max(Number(monthlyHousingPayment) || 0, 0);
+  const otherMonthlyDebts = pctOf(inputs.otherMonthlyDebts);
+  const frontEndPct = Math.max(clampDtiPct(inputs.frontEndDtiPct), 0.01); // floored to avoid a /0
+  const backEndPct = Math.max(clampDtiPct(inputs.backEndDtiPct), 0.01);
+
+  const requiredGrossMonthlyFrontEnd = clampDollars(M / (frontEndPct / 100));
+  const requiredGrossMonthlyBackEnd = clampDollars((M + otherMonthlyDebts) / (backEndPct / 100));
+  const bindingConstraint = requiredGrossMonthlyFrontEnd >= requiredGrossMonthlyBackEnd ? "front-end" : "back-end";
+  const requiredGrossMonthly = Math.max(requiredGrossMonthlyFrontEnd, requiredGrossMonthlyBackEnd);
+  return { requiredGrossMonthly, requiredGrossAnnual: clampDollars(requiredGrossMonthly * 12), bindingConstraint };
+}
+
+// Where the currently configured new-home payment actually falls against entered income — the
+// real-world mirror of the two functions above, which only describe limits/targets. Net income
+// (after tax) is optional and shown as a plain "% of take-home" gut check alongside the two
+// formal, gross-income-based DTI ratios lenders actually use.
+export function computeActualDti(inputs, monthlyHousingPayment) {
+  const grossMonthly = pctOf(inputs.grossAnnualIncome) / 12;
+  const netMonthly = pctOf(inputs.netAnnualIncome) / 12;
+  const otherMonthlyDebts = pctOf(inputs.otherMonthlyDebts);
+  const M = Math.max(Number(monthlyHousingPayment) || 0, 0);
+  const frontEndActualPct = grossMonthly > 0 ? (M / grossMonthly) * 100 : null;
+  const backEndActualPct = grossMonthly > 0 ? ((M + otherMonthlyDebts) / grossMonthly) * 100 : null;
+  const netHousingActualPct = netMonthly > 0 ? (M / netMonthly) * 100 : null;
+  return { frontEndActualPct, backEndActualPct, netHousingActualPct };
+}
+
 // Estimated year equity in the new home first reaches 20% (when PMI would typically drop off),
 // via the same amortization + appreciation assumptions as the equity-over-time chart above.
 export function estimatePmiRemovalYear(inputs, buySide) {
