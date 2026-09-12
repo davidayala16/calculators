@@ -7,6 +7,7 @@ import {
   computeBridgeCarryCost, computeGapHousingCost, computeRateScenarios, computeRateSensitivityTable,
   computePointsBreakeven, computeEquityOverTime, estimatePmiRemovalYear, buildAmortization,
   computeMaxAffordablePrice, computeRequiredIncome, computeActualDti,
+  computeDownPaymentNeeded, monthlyHousingCostForPrice,
 } from './model.js';
 
 const INK = "#12141C";
@@ -53,7 +54,7 @@ const DEFAULTS = {
   sensMinRate: 5, sensMaxRate: 8.5, sensStep: 0.5,
   // Income & affordability
   grossAnnualIncome: 150000, netAnnualIncome: 112000, otherMonthlyDebts: 400,
-  frontEndDtiPct: 28, backEndDtiPct: 36,
+  frontEndDtiPct: 28, backEndDtiPct: 36, checkHomePrice: 650000,
 };
 
 function CollapsibleHeader({ label, expandedKey, expanded, toggle }) {
@@ -128,6 +129,7 @@ function HomeSalePurchaseCalculator() {
   const [otherMonthlyDebts, setOtherMonthlyDebts] = useState(DEFAULTS.otherMonthlyDebts);
   const [frontEndDtiPct, setFrontEndDtiPct] = useState(DEFAULTS.frontEndDtiPct);
   const [backEndDtiPct, setBackEndDtiPct] = useState(DEFAULTS.backEndDtiPct);
+  const [checkHomePrice, setCheckHomePrice] = useState(DEFAULTS.checkHomePrice);
 
   const [expanded, setExpanded] = useState({
     oldHome: true, selling: true, newHome: true, loan: true, income: true,
@@ -187,6 +189,7 @@ function HomeSalePurchaseCalculator() {
     if (p.otherMonthlyDebts !== undefined) setOtherMonthlyDebts(p.otherMonthlyDebts);
     if (p.frontEndDtiPct !== undefined) setFrontEndDtiPct(p.frontEndDtiPct);
     if (p.backEndDtiPct !== undefined) setBackEndDtiPct(p.backEndDtiPct);
+    if (p.checkHomePrice !== undefined) setCheckHomePrice(p.checkHomePrice);
   };
 
   const profileSnapshot = {
@@ -198,7 +201,7 @@ function HomeSalePurchaseCalculator() {
     newMortgageRatePct, newLoanTermYears, loanType, armInitialPeriodYears, armPostAdjustRatePct, discountPoints,
     timingMode, gapMonths, tempHousingMonthly, bridgeLoanAmount, bridgeLoanRatePct, overlapMonths,
     homeAppreciationPct, comparisonYears, sensMinRate, sensMaxRate, sensStep,
-    grossAnnualIncome, netAnnualIncome, otherMonthlyDebts, frontEndDtiPct, backEndDtiPct,
+    grossAnnualIncome, netAnnualIncome, otherMonthlyDebts, frontEndDtiPct, backEndDtiPct, checkHomePrice,
   };
 
   const encodeProfile = (obj) => {
@@ -312,6 +315,18 @@ function HomeSalePurchaseCalculator() {
   const requiredIncome = useMemo(() => computeRequiredIncome(buySide.totalMonthly, inputs), [inputs, buySide]);
 
   const actualDti = useMemo(() => computeActualDti(inputs, buySide.totalMonthly), [inputs, buySide]);
+
+  // "Check this price": for a price the user types in directly (independent of the purchase-price
+  // field above), what down payment does your entered income require, and what income does your
+  // entered/available down payment require — the two things affordability for a specific listing
+  // actually depends on.
+  const checkPriceMonthly = useMemo(() => monthlyHousingCostForPrice(checkHomePrice, downPayment, inputs), [checkHomePrice, downPayment, inputs]);
+
+  const checkPriceRequiredIncome = useMemo(() => computeRequiredIncome(checkPriceMonthly, inputs), [checkPriceMonthly, inputs]);
+
+  const checkPriceDownPaymentNeeded = useMemo(() => computeDownPaymentNeeded(checkHomePrice, maxAffordable.maxHousingPayment, inputs), [checkHomePrice, maxAffordable, inputs]);
+
+  const checkPriceCashGap = checkPriceDownPaymentNeeded === null ? null : fundsAvailable.total - checkPriceDownPaymentNeeded;
 
   const oldAmort = useMemo(() => buildAmortization({
     loanAmount: oldPayment.balance, ratePct: oldPayment.rate, termYears: oldPayment.remainingYears,
@@ -543,6 +558,10 @@ function HomeSalePurchaseCalculator() {
                 <div className="hsp-row"><span style={{ fontSize: "12px" }}>Max home price you qualify for</span><span className="hsp-mono" style={{ fontSize: "13px", fontWeight: 700, color: NEW }}>{fmtMoney(maxAffordable.maxHomePrice)}</span></div>
                 <div className="hsp-row"><span style={{ fontSize: "12px" }}>Gross income needed for your configured new home price</span><span className="hsp-mono" style={{ fontSize: "12px" }}>{fmtMoney(requiredIncome.requiredGrossAnnual)}/yr</span></div>
               </div>
+              <div style={{ marginTop: "18px" }}>
+                <Field label="Check a specific home price" value={checkHomePrice} onChange={setCheckHomePrice}
+                  help="Any listing price you're considering — independent of the purchase price above. See the down payment and income it needs in the AFFORDABILITY panel." />
+              </div>
             </>
           )}
 
@@ -677,6 +696,30 @@ function HomeSalePurchaseCalculator() {
                 <span className="hsp-mono" style={{ fontSize: "12px" }}>
                   {actualDti.netHousingActualPct !== null ? fmtPct(actualDti.netHousingActualPct, 1) : "— (enter net income)"}
                 </span>
+              </div>
+            </div>
+          </div>
+
+          <div style={{ marginBottom: "30px" }}>
+            <div className="hsp-section-label">CHECK A SPECIFIC PRICE: {fmtMoney(checkHomePrice)}</div>
+            <div className="hsp-card">
+              <div className="hsp-row"><span style={{ fontSize: "12px" }}>All-in monthly payment at this price, with your {fmtMoney(downPayment)} down payment</span><span className="hsp-mono" style={{ fontSize: "12px" }}>{fmtMoney(checkPriceMonthly)}/mo</span></div>
+              <div className="hsp-row" style={{ borderTop: `1px solid ${GRID}`, marginTop: "6px", paddingTop: "10px" }}>
+                <span style={{ fontSize: "12px" }}>Down payment needed at your entered income &amp; DTI limits</span>
+                <span className="hsp-mono" style={{ fontSize: "13px", fontWeight: 700, color: checkPriceDownPaymentNeeded === null ? DANGER : NEW }}>
+                  {checkPriceDownPaymentNeeded === null ? "Not affordable at any down payment" : fmtMoney(checkPriceDownPaymentNeeded)}
+                </span>
+              </div>
+              {checkPriceDownPaymentNeeded !== null && (
+                <div style={{ fontSize: "11px", color: MUTED, padding: "0 0 8px" }}>
+                  {checkPriceCashGap >= 0
+                    ? `${fmtMoney(checkPriceCashGap)} left over vs. your ${fmtMoney(fundsAvailable.total)} available.`
+                    : `${fmtMoney(Math.abs(checkPriceCashGap))} short of your ${fmtMoney(fundsAvailable.total)} available.`}
+                </div>
+              )}
+              <div className="hsp-row" style={{ borderTop: `1px solid ${GRID}`, marginTop: "6px", paddingTop: "10px" }}>
+                <span style={{ fontSize: "12px" }}>Gross income needed at your {fmtMoney(downPayment)} down payment</span>
+                <span className="hsp-mono" style={{ fontSize: "13px", fontWeight: 700 }}>{fmtMoney(checkPriceRequiredIncome.requiredGrossAnnual)}/yr</span>
               </div>
             </div>
           </div>
@@ -828,6 +871,15 @@ function HomeSalePurchaseCalculator() {
                   that would let your currently configured new-home payment clear both limits. Net
                   income (if entered) only drives the extra "% of take-home pay" line — a plain
                   budget gut-check, not a lending ratio.
+                </p>
+                <p>
+                  "Check a specific home price" runs the same two questions against a price you
+                  type in directly, independent of the purchase price used everywhere else on the
+                  page: down payment needed (holding your entered income fixed, solved the same
+                  bounded-search way as the max-price figure above) and gross income needed
+                  (holding your configured down payment fixed, the same closed-form calculation as
+                  the required-income figure above) — so you can sanity-check a specific listing
+                  without changing your main scenario.
                 </p>
               </div>
             )}

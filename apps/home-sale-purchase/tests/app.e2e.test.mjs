@@ -78,13 +78,13 @@ test('sweeps every numeric input with extreme values, across both timing modes, 
   await page.click('button:has-text("Buy before selling")');
   await page.waitForTimeout(150);
   let count = await page.locator('input[type="number"]').count();
-  assert.ok(count >= 34, `expected most numeric inputs to be mounted after expanding everything, got ${count}`);
+  assert.ok(count >= 35, `expected most numeric inputs to be mounted after expanding everything, got ${count}`);
   await sweepAllNumberInputs(page, errors, 'buy-before-sell');
 
   await page.click('button:has-text("Sell, then buy")');
   await page.waitForTimeout(150);
   count = await page.locator('input[type="number"]').count();
-  assert.ok(count >= 32, `expected numeric inputs to remain mounted in sell-then-buy mode, got ${count}`);
+  assert.ok(count >= 33, `expected numeric inputs to remain mounted in sell-then-buy mode, got ${count}`);
   await sweepAllNumberInputs(page, errors, 'sell-then-buy');
 
   await context.close();
@@ -152,8 +152,12 @@ test('affordability: zero income/DTI and back to normal without crashing or show
   await page.goto(BASE_URL, { waitUntil: 'networkidle' });
   await expandEverything(page);
 
+  // Finds the input that immediately follows a given field's label span. A `div:has(...)`-based
+  // filter matches any ANCESTOR div containing that label anywhere in its subtree (not just the
+  // field's own wrapper div), which silently grabs the wrong input — the first one in that much
+  // larger subtree — instead of erroring; the sibling xpath below is exact.
   const fieldInput = (label) =>
-    page.locator('div').filter({ has: page.locator('span.hsp-field-label', { hasText: label }) }).locator('input').first();
+    page.locator('span.hsp-field-label', { hasText: label }).locator('xpath=following-sibling::input[1]');
 
   const grossIncomeInput = fieldInput('Household gross annual income');
   const frontEndInput = fieldInput('Max front-end DTI');
@@ -183,6 +187,21 @@ test('affordability: zero income/DTI and back to normal without crashing or show
   assert.equal(await isShowingErrorBoundary(page), false, 'app crashed restoring normal income/DTI');
   bodyText = await page.locator('body').innerText();
   assert.ok(!bodyText.includes('NaN'), 'affordability panel should never render NaN after recovery');
+
+  // "Check a specific home price" against an extreme price — should report unaffordable rather
+  // than crash or render NaN/Infinity, then recover cleanly back to a normal, affordable price.
+  const checkPriceInput = fieldInput('Check a specific home price');
+  await retype(checkPriceInput, 900000000);
+  await page.waitForTimeout(150);
+  assert.equal(await isShowingErrorBoundary(page), false, 'app crashed checking an extreme home price');
+  bodyText = await page.locator('body').innerText();
+  assert.ok(!bodyText.includes('NaN'), 'price-check panel should never render NaN');
+  assert.ok(!bodyText.includes('Infinity'), 'price-check panel should never render Infinity');
+  assert.ok(bodyText.includes('Not affordable at any down payment'), 'an extreme price should be flagged unaffordable, not silently miscalculated');
+
+  await retype(checkPriceInput, 650000);
+  await page.waitForTimeout(150);
+  assert.equal(await isShowingErrorBoundary(page), false, 'app crashed recovering from an extreme checked price');
   assert.deepEqual(errors, [], 'no console/page errors during affordability edge-case editing');
 
   await context.close();

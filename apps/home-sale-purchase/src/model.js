@@ -306,7 +306,7 @@ function clampDtiPct(v) {
 // Property tax and PMI both scale with price (and PMI also depends on the down%, which itself
 // depends on price), so there's no closed-form inversion from a target payment back to a price —
 // this is the per-price cost function that solveMaxPriceForPayment below searches over.
-function monthlyHousingCostForPrice(price, downPayment, inputs) {
+export function monthlyHousingCostForPrice(price, downPayment, inputs) {
   const loanAmount = Math.max(price - downPayment, 0);
   const rate = Math.max(Number(inputs.newMortgageRatePct) || 0, 0);
   const termYears = clampYears(inputs.newLoanTermYears) || 30;
@@ -335,6 +335,25 @@ export function solveMaxPriceForPayment(maxHousingPayment, downPayment, inputs) 
     if (monthlyHousingCostForPrice(mid, dp, inputs) <= budget) lo = mid; else hi = mid;
   }
   return clampDollars(lo);
+}
+
+// Minimum down payment that brings a given home price's all-in monthly payment within
+// `maxHousingPayment`, for otherwise-fixed loan/tax/insurance/HOA/PMI inputs — the mirror of
+// solveMaxPriceForPayment above (that one holds down payment fixed and searches price; this one
+// holds price fixed and searches down payment). Cost is monotonic decreasing in down payment
+// (more down => smaller loan => lower payment), so a bounded binary search is safe here too.
+export function computeDownPaymentNeeded(price, maxHousingPayment, inputs) {
+  const p = Math.max(Number(price) || 0, 0);
+  const budget = Math.max(Number(maxHousingPayment) || 0, 0);
+  if (monthlyHousingCostForPrice(p, 0, inputs) <= budget) return 0; // affordable even with nothing down
+  if (monthlyHousingCostForPrice(p, p, inputs) > budget) return null; // unaffordable at this price at any down payment
+  let lo = 0;
+  let hi = p;
+  for (let i = 0; i < MAX_AFFORDABILITY_ITERATIONS; i++) {
+    const mid = (lo + hi) / 2;
+    if (monthlyHousingCostForPrice(p, mid, inputs) <= budget) hi = mid; else lo = mid;
+  }
+  return clampDollars(hi);
 }
 
 // Max home price a given gross income supports, under standard front-end (housing/gross) and
