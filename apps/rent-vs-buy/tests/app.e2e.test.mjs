@@ -216,3 +216,30 @@ test('corrupted localStorage falls back to defaults instead of crashing', { time
   await context.close();
   await browser.close();
 });
+
+// Usage tracking is compiled in only when the deploy workflow supplies VITE_GOATCOUNTER_URL.
+// A default build — local dev, this suite, anyone who clones the repo — must stay completely
+// inert: no third-party script, no request off-box. This also guards against the endpoint
+// ever being hardcoded back into the source.
+test('ships no analytics script when VITE_GOATCOUNTER_URL is unset at build time', { timeout: TEST_TIMEOUT_MS }, async () => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+
+  const analyticsRequests = [];
+  page.on('request', (r) => {
+    const url = r.url();
+    if (url.includes('goatcounter') || url.includes('gc.zgo.at')) analyticsRequests.push(url);
+  });
+
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  assert.deepEqual(analyticsRequests, [], 'an unconfigured build must not contact an analytics endpoint');
+  assert.equal(await page.locator('script[data-goatcounter]').count(), 0);
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+
+  await context.close();
+  await browser.close();
+});

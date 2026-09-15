@@ -31,11 +31,14 @@ below. Apply them from the start on the next one and skip that cycle.
 3. Implement the **persistence pattern** and the **crash-proofing
    checklist** below — both are required, not optional, for any
    calculator that takes numeric input and projects it forward.
-4. Write an e2e test suite at `apps/<name>/tests/`, modeled on
+4. Copy `src/analytics.js` across and call `initAnalytics()` from
+   `main.jsx` (see "Required: usage analytics" below). One line; without
+   it the new calculator is simply missing from the traffic report.
+5. Write an e2e test suite at `apps/<name>/tests/`, modeled on
    `apps/retirement-runway/tests/app.e2e.test.mjs` (see "Testing
    requirement" below). Run it and get it green before calling the app
    done.
-5. Add the app to the list in the root `README.md`. Nothing else needs
+6. Add the app to the list in the root `README.md`. Nothing else needs
    updating — the landing page and deploy are automatic.
 
 ## Required: the persistence pattern
@@ -64,6 +67,32 @@ in-progress edits. See the persistence comments in
 `apps/retirement-runway/src/App.jsx` for the specifics; the short
 version is `localStorage` is the right tool for continuous autosave,
 the URL is only for point-in-time sharing.
+
+## Required: usage analytics
+
+Traffic is counted with GoatCounter. Every app ships an identical
+`src/analytics.js` that injects the counter script only when
+`import.meta.env.VITE_GOATCOUNTER_URL` is set at build time; the deploy
+workflow supplies it from the `GOATCOUNTER_URL` repository variable.
+Copy the file verbatim into a new app and call `initAnalytics()` from
+`main.jsx` before `createRoot` — a visit should still count if the app
+throws on mount.
+
+Two properties of this setup are deliberate and worth not breaking:
+
+- **Never hardcode the endpoint into the source.** Unset means the
+  tracking compiles out completely, which is what keeps local dev, the
+  e2e suites, and forks from sending traffic to a stranger's dashboard.
+  Each suite has a test asserting an unconfigured build makes no
+  analytics request; keep it.
+- **There is no per-app configuration.** Each calculator is served from
+  its own path, so one GoatCounter site separates them by path in its
+  "Pages" report. Resist adding per-app site codes or custom
+  event names "so it's easier to filter" — the path already does it.
+
+Note for anyone asked where the numbers are: the repo's Insights →
+Traffic tab does **not** answer this. It counts clones (mostly Actions
+checkouts) and views of the GitHub repo page, not the deployed site.
 
 ## Required: crash-proofing numeric inputs
 
@@ -147,3 +176,8 @@ timeout is a proven-more-reliable pattern, not a stylistic preference.
 Keep additions consistent with the rest of this repo: self-contained
 static apps, no backend, no accounts, no external service dependencies
 beyond what's already in a given app's `package.json`.
+
+The one deliberate exception is the GoatCounter script described above,
+which is opt-in at build time and absent from an unconfigured build.
+That exception is not a precedent for adding more third-party scripts —
+anything else that phones home needs its own decision.
