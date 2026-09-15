@@ -29,3 +29,29 @@ cd apps/<name>
 npm install
 npm run dev
 ```
+
+## Usage analytics
+
+Per-calculator traffic is tracked with [GoatCounter](https://www.goatcounter.com/)
+(free for non-commercial use, no cookies, no consent banner). Because each
+calculator is served from its own path, a single GoatCounter site gives a
+per-calculator breakdown through its "Pages" report — there is nothing to
+configure per app.
+
+It is **off unless configured**. To turn it on:
+
+1. Create a site at [goatcounter.com](https://www.goatcounter.com/) and note
+   its code (the `<code>` in `<code>.goatcounter.com`).
+2. In this repo: **Settings → Secrets and variables → Actions → Variables →
+   New repository variable**, named `GOATCOUNTER_URL`, set to
+   `https://<code>.goatcounter.com/count`.
+3. Push to `main` (or re-run the deploy workflow). Every app and the landing
+   page pick it up on the next build.
+
+With the variable unset — local dev, the e2e suites, forks — the tracking
+code compiles out entirely and no request is made off-box. The e2e suites
+assert this, so the default build can't start phoning home by accident.
+
+Note that this only counts traffic to the deployed site. The repo's own
+Insights → Traffic tab measures clones and visits to the GitHub repo page
+(mostly CI checkouts), which is unrelated to calculator usage.

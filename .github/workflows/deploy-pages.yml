@@ -29,10 +29,20 @@ jobs:
           node-version: 20
 
       - name: Build every app and assemble the site
+        # Repository variable (Settings -> Secrets and variables -> Actions -> Variables),
+        # set to this site's GoatCounter count endpoint, e.g.
+        # https://<your-code>.goatcounter.com/count. Leave it unset and every app builds
+        # with usage tracking compiled out — nothing else here changes.
+        env:
+          VITE_GOATCOUNTER_URL: ${{ vars.GOATCOUNTER_URL }}
         run: |
           set -e
           mkdir -p site
           links=""
+          analytics=""
+          if [ -n "$VITE_GOATCOUNTER_URL" ]; then
+            analytics="<script data-goatcounter=\"$VITE_GOATCOUNTER_URL\" async src=\"https://gc.zgo.at/count.js\"></script>"
+          fi
           for dir in apps/*/; do
             name=$(basename "$dir")
             echo "== Building $name =="
@@ -58,6 +68,7 @@ jobs:
           <body>
             <h1>Calculators</h1>
             <ul>$links</ul>
+            $analytics
           </body>
           </html>
           HTML

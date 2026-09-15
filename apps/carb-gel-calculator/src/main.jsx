@@ -2,6 +2,7 @@ import { StrictMode, Component } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 import App from './App.jsx'
+import { initAnalytics } from './analytics.js'
 
 // Without this, an uncaught render error (e.g. from an extreme input overflowing the
 // scaling math) unmounts the whole tree and leaves just the bare page background —
@@ -61,6 +62,9 @@ class ErrorBoundary extends Component {
     return this.props.children
   }
 }
+
+// Fire before render so a visit still counts even if the app crashes on mount.
+initAnalytics()
 
 createRoot(document.getElementById('root')).render(
   <StrictMode>
