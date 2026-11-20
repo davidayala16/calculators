@@ -121,8 +121,14 @@ function fmtPct(n) { return `${n.toFixed(2)}%`; }
 function toReal(nominalPct, inflationPct) { return ((1 + nominalPct / 100) / (1 + inflationPct / 100) - 1) * 100; }
 function toNominal(realPct, inflationPct) { return ((1 + realPct / 100) * (1 + inflationPct / 100) - 1) * 100; }
 
-// monthly compounding: contributions arrive monthly, rate applied monthly — matches how
-// real accounts (and most other calculators) actually work, rather than one lump sum per year
+// The exact monthly rate that compounds to the given annual % over 12 months. Dividing the annual
+// rate by 12 instead (the "APR" shortcut) quietly compounds to more than the stated return — at a
+// 6.8% real return it's really ~7.0%/yr, which overstated a 35-year projection by ~5%. A return at
+// or below -100% floors at a -100% monthly rate (balance goes to zero) instead of producing NaN.
+function monthlyRateFor(annualPct) {
+  return Math.pow(Math.max(1 + safeNum(annualPct) / 100, 0), 1 / 12) - 1;
+}
+
 // monthly compounding: contributions arrive monthly, rate applied monthly — matches how
 // real accounts (and most other calculators) actually work, rather than one lump sum per year.
 // Raises can "mature" (slow down) after a set number of years, salary can be capped, and
@@ -133,7 +139,7 @@ function simulateRaiseSchedule({
   contributionGaps = [],
 }) {
   years = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS);
-  const monthlyRate = realPreReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPreReturn);
   let balance = currentBalance;
   let sal = salary;
   let annualContribution = startContribution;
@@ -142,8 +148,10 @@ function simulateRaiseSchedule({
   for (let y = 0; y < years; y++) {
     const monthlyContribution = (y < stopContributingYear ? annualContribution : 0) / 12;
     for (let m = 0; m < 12; m++) {
-      // contributionGaps: [{ accountId, start, end, delta }] in months from today — a stretch where
-      // one account contributes a different amount (delta = new − usual; a full pause is −usual).
+      // contributionGaps: [{ accountId, start, end, share, during }] in months from today — a stretch
+      // where one account contributes exactly `during`/mo instead of its usual amount. "Usual" is the
+      // account's `share` of this month's total, which includes its share of any raise money ("% of
+      // raise → retirement"), so a full pause ($0) stops that too instead of letting it keep flowing.
       // The balance keeps compounding through a pause; only the new money changes. If two periods
       // on the same account overlap, the one listed later wins, so changes never double-count.
       let change = 0;
@@ -155,7 +163,7 @@ function simulateRaiseSchedule({
           if (k < g.start || k >= g.end) continue;
           if (seen && seen.has(g.accountId)) continue;
           (seen || (seen = new Set())).add(g.accountId);
-          change += g.delta;
+          change += g.during - monthlyContribution * g.share;
         }
       }
       const thisMonth = Math.min(Math.max(monthlyContribution + change, 0), MAX_BALANCE);
@@ -174,7 +182,7 @@ function simulateRaiseSchedule({
 
 function simulateFlatSchedule({ currentBalance, flatAnnual, realPreReturn, years }) {
   years = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS);
-  const monthlyRate = realPreReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPreReturn);
   let balance = currentBalance;
   const monthlyContribution = flatAnnual / 12;
   for (let y = 0; y < years; y++) {
@@ -206,7 +214,7 @@ function spendingSmileFactor(age) {
 
 // single trajectory: withdraw a % of current (start-of-year) balance, paid out monthly, rest grows monthly
 function simulateDrawdown({ portfolioAtRetirement, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile }) {
-  const monthlyRate = realPostReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPostReturn);
   let val = portfolioAtRetirement;
   const rows = [];
   const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
@@ -392,7 +400,7 @@ const LTC_CARE_TYPES = [
 // kept as a separate function rather than bolting more parameters onto simulateDrawdown, since this
 // models a fundamentally different scenario (a stress test / comparison), not the baseline plan.
 function simulateDrawdownWithExtra({ portfolioAtRetirement, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile, extraStartAge, extraEndAge, extraAnnual, premiumAnnual }) {
-  const monthlyRate = realPostReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPostReturn);
   let val = portfolioAtRetirement;
   const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
   const lastAge = retireAge + span;
@@ -424,7 +432,7 @@ function partTimeGrossIncome(age, ptStartAge, ptEndAge, ptIncomeAtStart, raisePc
 // (mode "offset" — same total spending, portfolio drawn down slower) or stacks on top of it
 // (mode "stack" — same withdrawal, more total spending money).
 function simulateDrawdownWithPartTime({ portfolioAtRetirement, retireAge, horizonAge, realPostReturn, withdrawalRate, useSmile, ptStartAge, ptEndAge, ptIncomeAtStart, raisePct, ptMode, ptContributionPct }) {
-  const monthlyRate = realPostReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPostReturn);
   let val = portfolioAtRetirement;
   const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
   const lastAge = retireAge + span;
@@ -545,7 +553,7 @@ function simulateLegacyBuckets({ portfolioAtRetirement, accountMix, retireAge, h
     taxable: portfolioAtRetirement * accountMix.taxable,
     roth: portfolioAtRetirement * accountMix.roth,
   };
-  const monthlyRate = realPostReturn / 100 / 12;
+  const monthlyRate = monthlyRateFor(realPostReturn);
   const span = Math.min(Math.max(Math.trunc(horizonAge) - Math.trunc(retireAge), -1), MAX_YEARS);
   const lastAge = retireAge + span;
   for (let age = retireAge; age <= lastAge; age++) {
@@ -880,12 +888,17 @@ function RetirementRunwayV4() {
     salaryCap: useSalaryCap ? Number(salaryCap) : null,
   };
   // Every contribution change on every included account, resolved to months from today.
-  const contributionGaps = useMemo(() => activeAccounts.flatMap((a) => accountGaps(a).map((g) => {
-    const { start, end } = gapWindow(g, currentAge);
-    const usual = Math.max(safeNum(a.monthly), 0);
-    const during = Math.max(safeNum(g.monthlyDuring), 0);
-    return { accountId: a.id, start, end, delta: during - usual };
-  })).filter((g) => g.end > g.start && g.delta !== 0), [activeAccounts, currentAge]);
+  // `share` is the account's fraction of total monthly contributions, so raise money (which isn't tied
+  // to any one account) is split across accounts in proportion to what each contributes.
+  const contributionGaps = useMemo(() => {
+    const totalMonthly = activeAccounts.reduce((s, a) => s + Math.max(safeNum(a.monthly), 0), 0);
+    return activeAccounts.flatMap((a) => accountGaps(a).map((g) => {
+      const { start, end } = gapWindow(g, currentAge);
+      const share = totalMonthly > 0 ? Math.max(safeNum(a.monthly), 0) / totalMonthly : 0;
+      const during = Math.min(Math.max(safeNum(g.monthlyDuring), 0), MAX_BALANCE);
+      return { accountId: a.id, start, end, share, during, usual: Math.max(safeNum(a.monthly), 0) };
+    })).filter((g) => g.end > g.start);
+  }, [activeAccounts, currentAge]);
   const stopContributingYear = useStopContributing ? Math.max(Number(stopContributingAge) - Number(currentAge), 0) : Infinity;
 
   const schedule = useMemo(
@@ -1053,7 +1066,7 @@ function RetirementRunwayV4() {
   // so a large existing Roth balance with no new contributions still counts, and so does an account
   // you're only just starting to fund. "Other savings" has no tax treatment, so it isn't in the mix.
   const accountWeights = useMemo(() => {
-    const mr = realPreReturn / 100 / 12;
+    const mr = monthlyRateFor(realPreReturn);
     const months = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS) * 12;
     const rawGrowth = Math.pow(1 + mr, months);
     const growth = isFinite(rawGrowth) ? Math.min(Math.max(rawGrowth, 0), MAX_BALANCE) : MAX_BALANCE;
@@ -1068,7 +1081,7 @@ function RetirementRunwayV4() {
         fvContrib = 0;
         for (let k = 0; k < months; k++) {
           let amt = mo;
-          for (let i = own.length - 1; i >= 0; i--) if (k >= own[i].start && k < own[i].end) { amt = Math.max(mo + own[i].delta, 0); break; }
+          for (let i = own.length - 1; i >= 0; i--) if (k >= own[i].start && k < own[i].end) { amt = own[i].during; break; }
           fvContrib = Math.min(fvContrib * (1 + mr) + amt, MAX_BALANCE);
         }
       }
@@ -1439,7 +1452,7 @@ function RetirementRunwayV4() {
       const fixedAnnualWithdrawal = schedule.finalBalance * (Number(withdrawalRate) / 100);
       const monthlyWithdrawal = fixedAnnualWithdrawal / 12;
       for (let i = 0; i < rates.length; i++) {
-        const monthlyRate = rates[i] / 100 / 12;
+        const monthlyRate = monthlyRateFor(rates[i]);
         for (let m = 0; m < 12; m++) {
           val = val * (1 + monthlyRate) - monthlyWithdrawal;
           if (val < 0) val = 0;
