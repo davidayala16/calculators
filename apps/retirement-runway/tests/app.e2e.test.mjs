@@ -138,6 +138,100 @@ test('removing all accounts/expenses does not crash the app', { timeout: TEST_TI
   await browser.close();
 });
 
+test('Your Accounts what-if: excluding an account and overriding an amount, then resetting', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const card = page.locator('[data-account-card]').first();
+  const monthly = card.locator('input[aria-label^="Monthly contribution"]');
+  await monthly.fill('1000');
+  const totalLine = page.locator('text=/^Total: /').first();
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$1,000\/mo/);
+
+  // exclude the account: it drops out of the math, but its real amount is kept
+  await card.locator('input[type="checkbox"]').uncheck();
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$0\/mo.*what-if scenario \(actual \$1,000\/mo/);
+  assert.equal(await monthly.inputValue(), '1000');
+
+  // include it again with a different what-if amount
+  await card.locator('input[type="checkbox"]').check();
+  await card.locator('button:has-text("try a different amount")').click();
+  await card.locator('input[aria-label^="What-if monthly amount"]').fill('250');
+  await page.waitForTimeout(700); // past the autosave debounce
+  assert.match(await totalLine.innerText(), /Total: \$250\/mo/);
+  const saved = JSON.parse(await page.evaluate(() => localStorage.getItem('retirement-runway:autosave-v1')));
+  assert.equal(saved.accounts[0].whatIfMonthly, 250);
+  assert.equal(saved.accounts[0].monthly, 1000);
+
+  // reset restores the actual amounts
+  await page.click('button:has-text("reset what-if scenario")');
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$1,000\/mo/);
+  assert.doesNotMatch(await totalLine.innerText(), /what-if/);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
+test('per-account balances add up to the starting balance and drop out when the account is excluded', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const startLine = page.locator('[data-starting-balance]');
+  await page.locator('input[aria-label="Other savings not listed in Your Accounts"]').fill('5000');
+  await page.click('text=+ add account');
+  const cards = page.locator('[data-account-card]');
+  await cards.nth(0).locator('input[aria-label^="Current balance"]').fill('100000');
+  await cards.nth(1).locator('input[aria-label^="Current balance"]').fill('40000');
+  await page.waitForTimeout(100);
+  assert.match(await startLine.innerText(), /Starting balance: \$145,000/);
+
+  // excluding the second account removes its balance from the plan, but keeps the number on the card
+  await cards.nth(1).locator('input[type="checkbox"]').uncheck();
+  await page.waitForTimeout(700);
+  assert.match(await startLine.innerText(), /Starting balance: \$105,000/);
+  assert.equal(await cards.nth(1).locator('input[aria-label^="Current balance"]').inputValue(), '40000');
+  const saved = JSON.parse(await page.evaluate(() => localStorage.getItem('retirement-runway:autosave-v1')));
+  assert.equal(saved.accounts[1].balance, 40000);
+  assert.equal(saved.accounts[1].included, false);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
+test('a profile saved before per-account balances keeps its total as "other savings"', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.addInitScript(() => {
+    localStorage.setItem('retirement-runway:autosave-v1', JSON.stringify({
+      currentBalance: 250000,
+      accounts: [{ id: 'old1', label: 'Old 401k', monthly: 500, treatment: 'Roth (after-tax)', type: '401k' }],
+    }));
+  });
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+  assert.match(await page.locator('[data-starting-balance]').innerText(), /Starting balance: \$250,000/);
+  assert.equal(await page.locator('input[aria-label^="Current balance for Old 401k"]').inputValue(), '0');
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
 test('autosaves to localStorage and restores after a genuine browser restart', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();

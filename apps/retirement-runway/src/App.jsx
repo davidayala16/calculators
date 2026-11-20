@@ -48,7 +48,7 @@ const ACCOUNT_TYPES = [
 ];
 
 const DEFAULT_ACCOUNTS = [
-  { id: "a1", label: "401k", monthly: 0, treatment: "Roth (after-tax)", type: "401k" },
+  { id: "a1", label: "401k", balance: 0, monthly: 0, treatment: "Roth (after-tax)", type: "401k" },
 ];
 
 const DEFAULT_EXPENSES = [
@@ -69,6 +69,14 @@ function fmtMoney(n, compact = false) {
   const v = Math.round(n);
   if (compact && Math.abs(v) >= 1000) return "$" + (v / 1000).toLocaleString(undefined, { maximumFractionDigits: 0 }) + "k";
   return "$" + v.toLocaleString();
+}
+// Number() of a user-typed field, with blank/garbage/non-finite input treated as 0.
+function safeNum(v) {
+  const n = Number(v);
+  return isFinite(n) ? n : 0;
+}
+function hasWhatIf(a) {
+  return a && a.whatIfMonthly !== null && a.whatIfMonthly !== undefined && a.whatIfMonthly !== "" && isFinite(Number(a.whatIfMonthly));
 }
 function fmtPct(n) { return `${n.toFixed(2)}%`; }
 function toReal(nominalPct, inflationPct) { return ((1 + nominalPct / 100) / (1 + inflationPct / 100) - 1) * 100; }
@@ -765,7 +773,27 @@ function RetirementRunwayV4() {
   const nominalPreDisplay = returnMode === "nominal" ? Number(preReturnInput) : toNominal(Number(preReturnInput), Number(inflation));
   const nominalPostDisplay = returnMode === "nominal" ? Number(postReturnInput) : toNominal(Number(postReturnInput), Number(inflation));
 
-  const currentAnnualContribution = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) * 12;
+  // Scenario view of the accounts list: what every calculation below actually uses. Unchecking
+  // an account's "Include" box drops it from the math, and a "what-if" amount temporarily stands in
+  // for its real monthly contribution — both without touching the real numbers, so trying out
+  // "what if I stopped funding my Roth IRA" is one click to undo. `included`/`whatIfMonthly` are
+  // missing on profiles saved before this existed, so absence means "included, no override".
+  const activeAccounts = useMemo(
+    () => (Array.isArray(accounts) ? accounts : [])
+      .filter((a) => a && a.included !== false)
+      .map((a) => (hasWhatIf(a) ? { ...a, monthly: Number(a.whatIfMonthly) } : a)),
+    [accounts],
+  );
+  const baseMonthlyContribution = (Array.isArray(accounts) ? accounts : []).reduce((s, a) => s + Number((a && a.monthly) || 0), 0);
+  // Starting portfolio = "other savings" (the single balance field, which is all older profiles had)
+  // plus each included account's own balance — so unchecking an account removes its money too, not
+  // just its future contributions.
+  const accountsBalanceTotal = activeAccounts.reduce((s, a) => s + safeNum(a.balance), 0);
+  const startingBalance = Math.min(Math.max(safeNum(currentBalance) + accountsBalanceTotal, -MAX_BALANCE), MAX_BALANCE);
+  const baseBalanceTotal = (Array.isArray(accounts) ? accounts : []).reduce((s, a) => s + safeNum(a && a.balance), 0);
+  const scenarioActive = (Array.isArray(accounts) ? accounts : []).some((a) => a && (a.included === false || hasWhatIf(a)));
+
+  const currentAnnualContribution = activeAccounts.reduce((s, a) => s + Number(a.monthly || 0), 0) * 12;
   const currentMonthlyContribution = currentAnnualContribution / 12;
 
   const expenseMonthlyBase = expenses.reduce((s, e) => s + Number(e.monthly || 0), 0);
@@ -796,11 +824,11 @@ function RetirementRunwayV4() {
 
   const schedule = useMemo(
     () => simulateRaiseSchedule({
-      currentBalance: Number(currentBalance), salary: Number(salary), raisePct: Number(raisePct),
+      currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
       ...careerParams, stopContributingYear,
     }),
-    [currentBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]
+    [startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]
   );
 
   const target = targetMode === "fixed" ? Number(fixedTarget) : expensePre65 / (Math.max(Number(withdrawalRate), 0.1) / 100);
@@ -815,17 +843,17 @@ function RetirementRunwayV4() {
 
   const requiredRaiseAllocation = useMemo(() => {
     const fn = (pct) => simulateRaiseSchedule({
-      currentBalance: Number(currentBalance), salary: Number(salary), raisePct: Number(raisePct),
+      currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: pct, realPreReturn, years,
       ...careerParams, stopContributingYear,
     }).finalBalance;
     return solveForTarget(fn, 0, 100, target);
-  }, [currentBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [startingBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   const requiredFlatMonthly = useMemo(() => {
-    const fn = (flatMonthly) => simulateFlatSchedule({ currentBalance: Number(currentBalance), flatAnnual: flatMonthly * 12, realPreReturn, years });
+    const fn = (flatMonthly) => simulateFlatSchedule({ currentBalance: startingBalance, flatAnnual: flatMonthly * 12, realPreReturn, years });
     return solveForTarget(fn, 0, 30000, target);
-  }, [currentBalance, realPreReturn, years, target]);
+  }, [startingBalance, realPreReturn, years, target]);
 
   const dv = (val, age) => {
     if (!showNominalDollars) return val;
@@ -848,13 +876,13 @@ function RetirementRunwayV4() {
     return RETIRE_CHIPS.map((age) => {
       const yrs = Math.max(age - Number(currentAge), 0);
       const s = simulateRaiseSchedule({
-        currentBalance: Number(currentBalance), salary: Number(salary), raisePct: Number(raisePct),
+        currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: yrs,
         ...careerParams, stopContributingYear,
       });
       return { age, balance: s.finalBalance, gap: s.finalBalance - target };
     });
-  }, [currentAge, currentBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   const gap = schedule.finalBalance - target;
   const rothAdvantagePct = ((1 - Number(currentMarginalRate) / 100) / (1 - Number(retirementMarginalRate) / 100) - 1) * 100;
@@ -891,7 +919,7 @@ function RetirementRunwayV4() {
   const yearsToRetire = years;
 
   const coastFiNumber = fiNumber / Math.pow(1 + realPreReturn / 100, yearsToRetire);
-  const alreadyCoastFI = Number(currentBalance) >= coastFiNumber;
+  const alreadyCoastFI = startingBalance >= coastFiNumber;
 
   const earliestFireAge = useMemo(() => {
     // clamped to 0: a very negative typed currentAge would otherwise start this loop far below
@@ -899,14 +927,14 @@ function RetirementRunwayV4() {
     const startAge = Math.max(Number(currentAge) + 1, 0);
     for (let age = startAge; age <= 80; age++) {
       const s = simulateRaiseSchedule({
-        currentBalance: Number(currentBalance), salary: Number(salary), raisePct: Number(raisePct),
+        currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
         ...careerParams, stopContributingYear,
       });
       if (s.finalBalance >= fiNumber) return age;
     }
     return null;
-  }, [currentAge, currentBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   const coastFireAge = useMemo(() => {
     // total trip count clamped to MAX_YEARS regardless of how extreme currentAge/retireAge are
@@ -917,7 +945,7 @@ function RetirementRunwayV4() {
     const endAge = startAge + span;
     for (let age = startAge; age <= endAge; age++) {
       const s = simulateRaiseSchedule({
-        currentBalance: Number(currentBalance), salary: Number(salary), raisePct: Number(raisePct),
+        currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
         ...careerParams, stopContributingYear,
       });
@@ -925,35 +953,49 @@ function RetirementRunwayV4() {
       if (coastedToRetirement >= target) return age;
     }
     return null;
-  }, [currentAge, retireAge, currentBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, retireAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   // Withdrawal order: group accounts by tax treatment present, suggest a standard sequence
   const withdrawalOrderGroups = useMemo(() => {
-    const has = (t) => accounts.some((a) => a.treatment === t);
+    const has = (t) => activeAccounts.some((a) => a.treatment === t);
     const order = [];
     if (has("Taxable")) order.push({ label: "Taxable brokerage", why: "Lowest tax cost first (often long-term capital gains rates), and it lets everything else keep compounding." });
     if (has("Traditional (pre-tax)")) order.push({ label: "Traditional accounts", why: "Draw enough to fill up your lower tax brackets each year, before jumping to a higher one." });
     if (has("Triple tax-advantaged")) order.push({ label: "HSA", why: "Reimburse medical costs tax-free any time; after 65 it behaves like a Traditional account for non-medical spending." });
     if (has("Roth (after-tax)")) order.push({ label: "Roth accounts", why: "Draw last — tax-free growth compounds longest, and it's the most flexible bucket for a legacy or big one-off expense." });
     return order;
-  }, [accounts]);
-  const hasTraditional = accounts.some((a) => a.treatment === "Traditional (pre-tax)");
+  }, [activeAccounts]);
+  const hasTraditional = activeAccounts.some((a) => a.treatment === "Traditional (pre-tax)");
 
-  // Account tax-treatment mix, approximated from current contribution proportions —
-  // the calculator only tracks one blended portfolio balance, not per-account balances,
-  // so this assumes the mix of money going in roughly matches the mix coming out.
-  // Approximates withdrawal/balance composition from current contribution mix — this tool tracks
-  // one blended balance, not per-account balances. Falls back in two stages when there's no $
-  // contribution to weight by (e.g. every account shows $0/mo, the default for a new account): first
-  // to weighting by account COUNT instead (so one Roth account correctly reads as 100% Roth, not 0%
-  // everything), then to an even 25/25/25/25 split only if there are no accounts at all. Without
-  // this, a $0-contribution setup would make roth+traditional+hsa+taxable sum to 0% instead of
-  // 100%, silently dropping the whole balance from every section that relies on this split
-  // (After-Tax, IRMAA, RMD, NIIT, ACA, Legacy) rather than just being an imprecise estimate.
+  // Account tax-treatment mix. Each account's weight is its projected value at retirement — today's
+  // balance grown at the pre-retirement return plus the future value of its monthly contributions —
+  // so a large existing Roth balance with no new contributions still counts, and so does an account
+  // you're only just starting to fund. "Other savings" has no tax treatment, so it isn't in the mix.
+  const accountWeights = useMemo(() => {
+    const mr = realPreReturn / 100 / 12;
+    const months = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS) * 12;
+    const rawGrowth = Math.pow(1 + mr, months);
+    const growth = isFinite(rawGrowth) ? Math.min(Math.max(rawGrowth, 0), MAX_BALANCE) : MAX_BALANCE;
+    return activeAccounts.map((a) => {
+      const bal = Math.max(safeNum(a.balance), 0);
+      const mo = Math.max(safeNum(a.monthly), 0);
+      const fvContrib = Math.abs(mr) < 1e-12 ? mo * months : mo * (growth - 1) / mr;
+      const w = bal * growth + fvContrib;
+      return { treatment: a.treatment, weight: isFinite(w) ? Math.min(Math.max(w, 0), MAX_BALANCE) : MAX_BALANCE };
+    });
+  }, [activeAccounts, realPreReturn, years]);
+
+  // The projection itself runs on one blended balance; this split only approximates its tax
+  // composition. Falls back in two stages when there's nothing to weight by (every account at $0
+  // balance and $0/mo, the default for a new account): first to weighting by account COUNT (so one
+  // Roth account correctly reads as 100% Roth, not 0% everything), then to an even 25/25/25/25 split
+  // only if there are no accounts at all. Without this, roth+traditional+hsa+taxable would sum to 0%
+  // instead of 100%, silently dropping the whole balance from every section that relies on this
+  // split (After-Tax, IRMAA, RMD, NIIT, ACA, Legacy) rather than just being an imprecise estimate.
+  const totalAccountWeight = accountWeights.reduce((s, w) => s + w.weight, 0);
   const accountMix = useMemo(() => {
-    const totalMonthly = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0);
-    if (totalMonthly > 0) {
-      const pct = (treatment) => accounts.filter((a) => a.treatment === treatment).reduce((s, a) => s + Number(a.monthly || 0), 0) / totalMonthly;
+    if (totalAccountWeight > 0) {
+      const pct = (treatment) => accountWeights.filter((w) => w.treatment === treatment).reduce((s, w) => s + w.weight, 0) / totalAccountWeight;
       return {
         roth: pct("Roth (after-tax)"),
         traditional: pct("Traditional (pre-tax)"),
@@ -961,8 +1003,8 @@ function RetirementRunwayV4() {
         taxable: pct("Taxable"),
       };
     }
-    if (accounts.length > 0) {
-      const countPct = (treatment) => accounts.filter((a) => a.treatment === treatment).length / accounts.length;
+    if (activeAccounts.length > 0) {
+      const countPct = (treatment) => activeAccounts.filter((a) => a.treatment === treatment).length / activeAccounts.length;
       return {
         roth: countPct("Roth (after-tax)"),
         traditional: countPct("Traditional (pre-tax)"),
@@ -971,11 +1013,11 @@ function RetirementRunwayV4() {
       };
     }
     return { roth: 0.25, traditional: 0.25, hsa: 0.25, taxable: 0.25 };
-  }, [accounts]);
+  }, [accountWeights, totalAccountWeight, activeAccounts]);
 
-  // Whether accountMix above had real $ contributions to weight by, vs. falling back to account
-  // count/type or an even split — surfaced as a caveat in sections that lean on accountMix heavily.
-  const accountMixIsEstimated = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) <= 0;
+  // Whether accountMix above had real $ (balances or contributions) to weight by, vs. falling back
+  // to account count/type or an even split — surfaced as a caveat in sections that lean on it.
+  const accountMixIsEstimated = totalAccountWeight <= 0;
 
   // Part-time ("Barista FIRE") work window. If a start age earlier than retirement age is chosen,
   // it's floored at retirement age — working part-time before you've actually left your main job
@@ -1329,16 +1371,16 @@ function RetirementRunwayV4() {
 
   // Contribution limit checks
   const contributionLimitChecks = useMemo(() => {
-    return accounts.map((a) => {
+    return activeAccounts.map((a) => {
       const typeInfo = ACCOUNT_TYPES.find((t) => t.key === a.type) || ACCOUNT_TYPES[3];
       const limit = a.type === "hsa" ? (hsaCoverage === "family" ? 8750 : 4400) : typeInfo.limit;
       const annual = Number(a.monthly || 0) * 12;
       return { ...a, limit, annual, overLimit: limit !== null && annual > limit };
     });
-  }, [accounts, hsaCoverage]);
+  }, [activeAccounts, hsaCoverage]);
 
   const updateAccount = (id, field, val) => setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, [field]: val } : a)));
-  const addAccount = () => setAccounts((prev) => [...prev, { id: `acc${idCounter++}`, label: "New account", monthly: 0, treatment: "Roth (after-tax)", type: "other" }]);
+  const addAccount = () => setAccounts((prev) => [...prev, { id: `acc${idCounter++}`, label: "New account", balance: 0, monthly: 0, treatment: "Roth (after-tax)", type: "other" }]);
 
   const resetToBlank = () => {
     if (!window.confirm("Clear all inputs and start fresh? This can't be undone.")) return;
@@ -1346,7 +1388,7 @@ function RetirementRunwayV4() {
     setRaisePct(3); setRaiseAllocationPct(0); setUseRaiseSlowdown(false); setUseSalaryCap(false); setUseStopContributing(false);
     setReturnMode("nominal"); setInflation(3); setPreReturnInput(10); setPostReturnInput(8); setShowNominalDollars(false);
     setWithdrawalRate(4); setTargetMode("expense"); setFixedTarget(2000000);
-    setAccounts([{ id: "blank1", label: "My 401k", monthly: 0, treatment: "Roth (after-tax)", type: "401k" }]);
+    setAccounts([{ id: "blank1", label: "My 401k", balance: 0, monthly: 0, treatment: "Roth (after-tax)", type: "401k" }]);
     setExpenses(DEFAULT_EXPENSES.map((e) => ({ ...e, monthly: 0 })));
     setHealthcarePre65(0); setHealthcarePost65(0);
     setCurrentMarginalRate(12); setRetirementMarginalRate(12);
@@ -1367,6 +1409,7 @@ function RetirementRunwayV4() {
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
   };
+  const resetAccountScenario = () => setAccounts((prev) => prev.map((a) => ({ ...a, included: true, whatIfMonthly: null })));
   const removeAccount = (id) => setAccounts((prev) => prev.filter((a) => a.id !== id));
 
   const updateExpense = (id, field, val) => setExpenses((prev) => prev.map((e) => (e.id === id ? { ...e, [field]: val } : e)));
@@ -1570,8 +1613,13 @@ function RetirementRunwayV4() {
             <div style={{ flex: 1 }}><span className="rr-field-label">% of raise → retirement</span><input type="number" step="1" value={raiseAllocationPct} onChange={(e) => setRaiseAllocationPct(e.target.value)} /></div>
           </div>
           <div style={{ marginBottom: "18px" }}>
-            <span className="rr-field-label">Current retirement + brokerage balance</span>
-            <input type="number" value={currentBalance} onChange={(e) => setCurrentBalance(e.target.value)} />
+            <span className="rr-field-label">Other savings (not listed in Your Accounts)</span>
+            <input type="number" aria-label="Other savings not listed in Your Accounts" value={currentBalance} onChange={(e) => setCurrentBalance(e.target.value)} />
+            <div style={{ fontSize: "11px", color: MUTED, marginTop: "4px", lineHeight: 1.5 }}>
+              Put each account's balance on its card in Your Accounts; use this only for savings not listed
+              there, so nothing is counted twice.
+              <span className="rr-mono" data-starting-balance> Starting balance: {fmtMoney(startingBalance)}</span>
+            </div>
           </div>
 
           {uiMode === "advanced" && (
@@ -1629,20 +1677,51 @@ function RetirementRunwayV4() {
             <span className="rr-caret" style={{ transform: expanded.accountsPanel ? "rotate(90deg)" : "rotate(0deg)" }}>▸</span>
           </button>
           <div style={{ fontSize: "11px", color: MUTED, marginBottom: expanded.accountsPanel ? "10px" : "0" }} className="rr-mono">
-            Total: {fmtMoney(currentMonthlyContribution)}/mo · {fmtPct((currentAnnualContribution / Number(salary)) * 100)} of gross
+            Total: {fmtMoney(currentMonthlyContribution)}/mo · {fmtPct((currentAnnualContribution / Number(salary)) * 100)} of gross · {fmtMoney(accountsBalanceTotal)} in balances
+            {scenarioActive && (
+              <span style={{ color: BRASS }}> · what-if scenario (actual {fmtMoney(baseMonthlyContribution)}/mo, {fmtMoney(baseBalanceTotal)} in balances)</span>
+            )}
           </div>
           {expanded.accountsPanel && (
           <>
-          {accounts.map((a) => (
-            <div key={a.id} style={{ border: `1px solid ${GRID}`, borderRadius: "4px", padding: "10px", marginBottom: "8px" }}>
-              <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+          <div style={{ fontSize: "11px", color: MUTED, marginBottom: "10px", lineHeight: 1.5 }}>
+            Uncheck an account to see your plan without it (its balance and contributions both drop out),
+            or set a what-if amount to try a different monthly contribution — your real numbers stay
+            saved underneath.
+          </div>
+          {accounts.map((a) => {
+            const included = a.included !== false;
+            const whatIf = hasWhatIf(a);
+            return (
+            <div key={a.id} data-account-card style={{ border: `1px solid ${whatIf && included ? BRASS : GRID}`, borderRadius: "4px", padding: "10px", marginBottom: "8px", opacity: included ? 1 : 0.5 }}>
+              <div style={{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  aria-label={`Include ${a.label} in plan`}
+                  title={included ? "Included in the plan — uncheck to see your plan without this account" : "Excluded from the plan — check to add it back"}
+                  checked={included}
+                  onChange={(e) => updateAccount(a.id, "included", e.target.checked)}
+                  style={{ width: "16px", height: "16px", flexShrink: 0, cursor: "pointer", accentColor: BRASS }}
+                />
                 <input type="text" value={a.label} onChange={(e) => updateAccount(a.id, "label", e.target.value)} style={{ flex: 1, fontFamily: "Inter", fontSize: "12px" }} />
                 <button className="rr-x-btn" onClick={() => removeAccount(a.id)}>×</button>
               </div>
-              <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
-                <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
-                <input type="number" value={a.monthly} onChange={(e) => updateAccount(a.id, "monthly", Number(e.target.value))} />
-                <span className="rr-mono" style={{ fontSize: "11px", color: MUTED }}>/mo</span>
+              <div style={{ display: "flex", gap: "8px" }}>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span className="rr-field-label">Balance today</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
+                    <input type="number" aria-label={`Current balance for ${a.label}`} value={a.balance ?? 0} onChange={(e) => updateAccount(a.id, "balance", Number(e.target.value))} />
+                  </div>
+                </div>
+                <div style={{ flex: 1, minWidth: 0 }}>
+                  <span className="rr-field-label">Contributing</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
+                    <input type="number" aria-label={`Monthly contribution for ${a.label}`} value={a.monthly} onChange={(e) => updateAccount(a.id, "monthly", Number(e.target.value))} />
+                    <span className="rr-mono" style={{ fontSize: "11px", color: MUTED }}>/mo</span>
+                  </div>
+                </div>
               </div>
               <select value={a.treatment} onChange={(e) => updateAccount(a.id, "treatment", e.target.value)} style={{ marginTop: "6px" }}>
                 {TREATMENTS.map((t) => (<option key={t} value={t}>{t}</option>))}
@@ -1650,8 +1729,27 @@ function RetirementRunwayV4() {
               <select value={a.type} onChange={(e) => updateAccount(a.id, "type", e.target.value)} style={{ marginTop: "6px" }}>
                 {ACCOUNT_TYPES.map((t) => (<option key={t.key} value={t.key}>{t.label}</option>))}
               </select>
+              {!included ? (
+                <div className="rr-mono" style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>Excluded from this scenario</div>
+              ) : whatIf ? (
+                <div style={{ marginTop: "6px" }}>
+                  <span className="rr-field-label" style={{ color: BRASS }}>What-if amount (actual {fmtMoney(Number(a.monthly || 0))}/mo)</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
+                    <input type="number" aria-label={`What-if monthly amount for ${a.label}`} value={a.whatIfMonthly} onChange={(e) => updateAccount(a.id, "whatIfMonthly", Number(e.target.value))} />
+                    <span className="rr-mono" style={{ fontSize: "11px", color: MUTED }}>/mo</span>
+                    <button className="rr-x-btn" title="Clear what-if amount" onClick={() => updateAccount(a.id, "whatIfMonthly", null)}>×</button>
+                  </div>
+                </div>
+              ) : (
+                <button className="rr-add-btn" style={{ marginTop: "6px", padding: "5px" }} onClick={() => updateAccount(a.id, "whatIfMonthly", Number(a.monthly || 0))}>try a different amount</button>
+              )}
             </div>
-          ))}
+            );
+          })}
+          {scenarioActive && (
+            <button className="rr-add-btn" style={{ marginBottom: "6px", color: BRASS, borderColor: BRASS }} onClick={resetAccountScenario}>↺ reset what-if scenario (include all, use actual amounts)</button>
+          )}
           <button className="rr-add-btn" onClick={addAccount}>+ add account</button>
           </>
           )}
@@ -2017,7 +2115,7 @@ function RetirementRunwayV4() {
             </div>
             {accountMixIsEstimated && (
               <div style={{ fontSize: "11px", color: RUST, marginTop: "12px", lineHeight: 1.6 }}>
-                None of your accounts in "Your Accounts" show a monthly contribution, so the Roth/Traditional/HSA/
+                None of your accounts in "Your Accounts" show a balance or monthly contribution, so the Roth/Traditional/HSA/
                 Taxable split above is estimated from account types instead of a real $ mix — add a monthly amount
                 there (even a rough one) for a more accurate breakdown.
               </div>
@@ -2248,7 +2346,7 @@ function RetirementRunwayV4() {
             )}
             {accountMixIsEstimated && (
               <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
-                None of your accounts in "Your Accounts" show a monthly contribution, so the MAGI estimate above is
+                None of your accounts in "Your Accounts" show a balance or monthly contribution, so the MAGI estimate above is
                 based on account types instead of a real $ mix — add a monthly amount there (even a rough one) for a
                 more accurate estimate.
               </div>
@@ -2327,7 +2425,7 @@ function RetirementRunwayV4() {
             )}
             {accountMixIsEstimated && (
               <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
-                None of your accounts in "Your Accounts" show a monthly contribution, so "Traditional balance" above
+                None of your accounts in "Your Accounts" show a balance or monthly contribution, so "Traditional balance" above
                 is estimated from account types instead of a real $ mix — add a monthly amount there (even a rough
                 one) for a more accurate RMD estimate.
               </div>
@@ -2417,7 +2515,7 @@ function RetirementRunwayV4() {
 
                 {accountMixIsEstimated && (
                   <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
-                    None of your accounts in "Your Accounts" show a monthly contribution, so the Traditional/taxable
+                    None of your accounts in "Your Accounts" show a balance or monthly contribution, so the Traditional/taxable
                     portion of MAGI above is estimated from account types instead of a real $ mix — add a monthly
                     amount there (even a rough one) for a more accurate MAGI estimate.
                   </div>
@@ -2478,7 +2576,7 @@ function RetirementRunwayV4() {
             )}
             {accountMixIsEstimated && (
               <div style={{ fontSize: "11px", color: RUST, marginTop: "10px", lineHeight: 1.6 }}>
-                None of your accounts in "Your Accounts" show a monthly contribution, so the taxable/net-investment-
+                None of your accounts in "Your Accounts" show a balance or monthly contribution, so the taxable/net-investment-
                 income portion above is estimated from account types instead of a real $ mix — add a monthly amount
                 there (even a rough one) for a more accurate estimate.
               </div>
@@ -2754,7 +2852,7 @@ function RetirementRunwayV4() {
                 )}
                 {accountMixIsEstimated && (
                   <div style={{ fontSize: "11px", color: RUST, marginBottom: "10px", lineHeight: 1.6 }}>
-                    None of your accounts in "Your Accounts" show a monthly contribution, so "Status quo" and the
+                    None of your accounts in "Your Accounts" show a balance or monthly contribution, so "Status quo" and the
                     starting balance split above are estimated from account <em>types</em> instead (weighted evenly
                     across whichever types you've added) rather than from a real $ mix. Add a monthly amount (even a
                     rough one) there for a more realistic starting point.
@@ -2858,7 +2956,7 @@ function RetirementRunwayV4() {
               <div style={{ fontSize: "12px", color: MUTED, lineHeight: 1.6 }}>
                 Today's Coast FI number (what you'd need right now, invested, to coast to {fmtMoney(target)} by age {retireAge}
                 with zero more contributions) is <span style={{ color: PARCHMENT }}>{fmtMoney(coastFiNumber)}</span>.
-                Your current balance is <span style={{ color: PARCHMENT }}>{fmtMoney(Number(currentBalance))}</span>.
+                Your current balance is <span style={{ color: PARCHMENT }}>{fmtMoney(startingBalance)}</span>.
               </div>
             </div>
 
@@ -3178,7 +3276,7 @@ function RetirementRunwayV4() {
         <p style={{ fontSize: "13px", lineHeight: 1.8 }}>
           Current age {currentAge}, retiring at {retireAge}, planning through age {horizonAge}.<br />
           Salary {fmtMoney(Number(salary))}, growing {raisePct}%/yr, with {raiseAllocationPct}% of each raise directed to retirement.<br />
-          Current retirement + brokerage balance: {fmtMoney(Number(currentBalance))}. Monthly contribution: {fmtMoney(currentMonthlyContribution)}.<br />
+          Current retirement + brokerage balance: {fmtMoney(startingBalance)}. Monthly contribution: {fmtMoney(currentMonthlyContribution)}.<br />
           Assumed returns: {fmtPct(realPreReturn)} real pre-retirement, {fmtPct(realPostReturn)} real post-retirement, {inflation}% inflation.<br />
           Withdrawal rate: {withdrawalRate}%. Target: {targetMode === "expense" ? "based on expense budget" : "fixed"} at {fmtMoney(target)}.
         </p>
