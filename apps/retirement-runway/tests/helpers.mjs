@@ -108,6 +108,13 @@ export async function expandEverything(page) {
       count = await locator.count();
     }
   }
+  // Returns & Inflation: "+ custom market event" never disappears (you can add any number), so it
+  // can't go in the loop above — click it once to mount one event's start/length/return inputs.
+  const addMarketEvent = page.locator('button:has-text("+ custom market event")').first();
+  if (await addMarketEvent.count()) {
+    await addMarketEvent.click();
+    await page.waitForTimeout(80);
+  }
   await page.waitForTimeout(200);
 }
 

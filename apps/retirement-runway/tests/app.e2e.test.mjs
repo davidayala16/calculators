@@ -341,6 +341,54 @@ test('gap math: exact monthly compounding, and a full pause also stops raise-all
   await browser.close();
 });
 
+// Values cross-checked against an independent month-by-month calculation (10% nominal, 3% inflation,
+// age 30 -> 65, $50k + $1,000/mo; nominal event returns converted to real with the inflation input).
+test('market events: a crash changes the projection and the cost of a gap during it', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const card = page.locator('[data-account-card]').first();
+  await card.locator('input[aria-label^="Current balance"]').fill('50000');
+  await card.locator('input[aria-label^="Monthly contribution"]').fill('1000');
+  // 1-year full pause starting 5 years from now
+  await card.locator('button:has-text("pause contributions (gap)")').click();
+  await card.locator('select[aria-label^="Gap start unit"]').selectOption('yearsFromNow');
+  await card.locator('input[aria-label^="Gap start for"]').fill('5');
+
+  // a -35% crash over that same year, with no rebound: a permanent drop, so skipped money dodges it
+  await page.click('button:has-text("+ custom market event")');
+  const ev = page.locator('[data-market-event]').first();
+  await ev.locator('input[aria-label$=" start"]').fill('5');
+  await ev.locator('input[aria-label$=" return"]').fill('-35');
+  await ev.locator('select[aria-label$="return mode"]').selectOption('total');
+  await page.waitForTimeout(150);
+  const impact = page.locator('[data-gap-impact]');
+  assert.match(await impact.innerText(), /from \$1,705,166 to \$1,639,179/);
+  assert.match(await page.locator('[data-gap-steady]').innerText(), /steady returns instead: \$83,264.*cheaper/s);
+
+  // swap to the crash-and-rebound preset (starting 5 years out): now pausing in the crash costs MORE
+  await ev.locator('.rr-x-btn').click();
+  await page.click('button:has-text("Crash & rebound")');
+  const events = page.locator('[data-market-event]');
+  assert.equal(await events.count(), 2);
+  await events.nth(0).locator('input[aria-label$=" start"]').fill('5');
+  await events.nth(1).locator('input[aria-label$=" start"]').fill('6');
+  await page.waitForTimeout(700);
+  assert.match(await page.locator('[data-gap-steady]').innerText(), /\$85,211.*steady returns instead: \$83,264.*more expensive/s);
+
+  const saved = JSON.parse(await page.evaluate(() => localStorage.getItem('retirement-runway:autosave-v1')));
+  assert.equal(saved.marketEvents.length, 2);
+  assert.equal(saved.marketEvents[0].returnPct, -35);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
 test('autosaves to localStorage and restores after a genuine browser restart', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();
