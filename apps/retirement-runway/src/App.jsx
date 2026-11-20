@@ -70,6 +70,9 @@ function fmtMoney(n, compact = false) {
   if (compact && Math.abs(v) >= 1000) return "$" + (v / 1000).toLocaleString(undefined, { maximumFractionDigits: 0 }) + "k";
   return "$" + v.toLocaleString();
 }
+function hasWhatIf(a) {
+  return a && a.whatIfMonthly !== null && a.whatIfMonthly !== undefined && a.whatIfMonthly !== "" && isFinite(Number(a.whatIfMonthly));
+}
 function fmtPct(n) { return `${n.toFixed(2)}%`; }
 function toReal(nominalPct, inflationPct) { return ((1 + nominalPct / 100) / (1 + inflationPct / 100) - 1) * 100; }
 function toNominal(realPct, inflationPct) { return ((1 + realPct / 100) * (1 + inflationPct / 100) - 1) * 100; }
@@ -765,7 +768,21 @@ function RetirementRunwayV4() {
   const nominalPreDisplay = returnMode === "nominal" ? Number(preReturnInput) : toNominal(Number(preReturnInput), Number(inflation));
   const nominalPostDisplay = returnMode === "nominal" ? Number(postReturnInput) : toNominal(Number(postReturnInput), Number(inflation));
 
-  const currentAnnualContribution = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) * 12;
+  // Scenario view of the accounts list: what every calculation below actually uses. Unchecking
+  // an account's "Include" box drops it from the math, and a "what-if" amount temporarily stands in
+  // for its real monthly contribution — both without touching the real numbers, so trying out
+  // "what if I stopped funding my Roth IRA" is one click to undo. `included`/`whatIfMonthly` are
+  // missing on profiles saved before this existed, so absence means "included, no override".
+  const activeAccounts = useMemo(
+    () => (Array.isArray(accounts) ? accounts : [])
+      .filter((a) => a && a.included !== false)
+      .map((a) => (hasWhatIf(a) ? { ...a, monthly: Number(a.whatIfMonthly) } : a)),
+    [accounts],
+  );
+  const baseMonthlyContribution = (Array.isArray(accounts) ? accounts : []).reduce((s, a) => s + Number((a && a.monthly) || 0), 0);
+  const scenarioActive = (Array.isArray(accounts) ? accounts : []).some((a) => a && (a.included === false || hasWhatIf(a)));
+
+  const currentAnnualContribution = activeAccounts.reduce((s, a) => s + Number(a.monthly || 0), 0) * 12;
   const currentMonthlyContribution = currentAnnualContribution / 12;
 
   const expenseMonthlyBase = expenses.reduce((s, e) => s + Number(e.monthly || 0), 0);
@@ -929,15 +946,15 @@ function RetirementRunwayV4() {
 
   // Withdrawal order: group accounts by tax treatment present, suggest a standard sequence
   const withdrawalOrderGroups = useMemo(() => {
-    const has = (t) => accounts.some((a) => a.treatment === t);
+    const has = (t) => activeAccounts.some((a) => a.treatment === t);
     const order = [];
     if (has("Taxable")) order.push({ label: "Taxable brokerage", why: "Lowest tax cost first (often long-term capital gains rates), and it lets everything else keep compounding." });
     if (has("Traditional (pre-tax)")) order.push({ label: "Traditional accounts", why: "Draw enough to fill up your lower tax brackets each year, before jumping to a higher one." });
     if (has("Triple tax-advantaged")) order.push({ label: "HSA", why: "Reimburse medical costs tax-free any time; after 65 it behaves like a Traditional account for non-medical spending." });
     if (has("Roth (after-tax)")) order.push({ label: "Roth accounts", why: "Draw last — tax-free growth compounds longest, and it's the most flexible bucket for a legacy or big one-off expense." });
     return order;
-  }, [accounts]);
-  const hasTraditional = accounts.some((a) => a.treatment === "Traditional (pre-tax)");
+  }, [activeAccounts]);
+  const hasTraditional = activeAccounts.some((a) => a.treatment === "Traditional (pre-tax)");
 
   // Account tax-treatment mix, approximated from current contribution proportions —
   // the calculator only tracks one blended portfolio balance, not per-account balances,
@@ -951,9 +968,9 @@ function RetirementRunwayV4() {
   // 100%, silently dropping the whole balance from every section that relies on this split
   // (After-Tax, IRMAA, RMD, NIIT, ACA, Legacy) rather than just being an imprecise estimate.
   const accountMix = useMemo(() => {
-    const totalMonthly = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0);
+    const totalMonthly = activeAccounts.reduce((s, a) => s + Number(a.monthly || 0), 0);
     if (totalMonthly > 0) {
-      const pct = (treatment) => accounts.filter((a) => a.treatment === treatment).reduce((s, a) => s + Number(a.monthly || 0), 0) / totalMonthly;
+      const pct = (treatment) => activeAccounts.filter((a) => a.treatment === treatment).reduce((s, a) => s + Number(a.monthly || 0), 0) / totalMonthly;
       return {
         roth: pct("Roth (after-tax)"),
         traditional: pct("Traditional (pre-tax)"),
@@ -961,8 +978,8 @@ function RetirementRunwayV4() {
         taxable: pct("Taxable"),
       };
     }
-    if (accounts.length > 0) {
-      const countPct = (treatment) => accounts.filter((a) => a.treatment === treatment).length / accounts.length;
+    if (activeAccounts.length > 0) {
+      const countPct = (treatment) => activeAccounts.filter((a) => a.treatment === treatment).length / activeAccounts.length;
       return {
         roth: countPct("Roth (after-tax)"),
         traditional: countPct("Traditional (pre-tax)"),
@@ -971,11 +988,11 @@ function RetirementRunwayV4() {
       };
     }
     return { roth: 0.25, traditional: 0.25, hsa: 0.25, taxable: 0.25 };
-  }, [accounts]);
+  }, [activeAccounts]);
 
   // Whether accountMix above had real $ contributions to weight by, vs. falling back to account
   // count/type or an even split — surfaced as a caveat in sections that lean on accountMix heavily.
-  const accountMixIsEstimated = accounts.reduce((s, a) => s + Number(a.monthly || 0), 0) <= 0;
+  const accountMixIsEstimated = activeAccounts.reduce((s, a) => s + Number(a.monthly || 0), 0) <= 0;
 
   // Part-time ("Barista FIRE") work window. If a start age earlier than retirement age is chosen,
   // it's floored at retirement age — working part-time before you've actually left your main job
@@ -1329,13 +1346,13 @@ function RetirementRunwayV4() {
 
   // Contribution limit checks
   const contributionLimitChecks = useMemo(() => {
-    return accounts.map((a) => {
+    return activeAccounts.map((a) => {
       const typeInfo = ACCOUNT_TYPES.find((t) => t.key === a.type) || ACCOUNT_TYPES[3];
       const limit = a.type === "hsa" ? (hsaCoverage === "family" ? 8750 : 4400) : typeInfo.limit;
       const annual = Number(a.monthly || 0) * 12;
       return { ...a, limit, annual, overLimit: limit !== null && annual > limit };
     });
-  }, [accounts, hsaCoverage]);
+  }, [activeAccounts, hsaCoverage]);
 
   const updateAccount = (id, field, val) => setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, [field]: val } : a)));
   const addAccount = () => setAccounts((prev) => [...prev, { id: `acc${idCounter++}`, label: "New account", monthly: 0, treatment: "Roth (after-tax)", type: "other" }]);
@@ -1367,6 +1384,7 @@ function RetirementRunwayV4() {
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
   };
+  const resetAccountScenario = () => setAccounts((prev) => prev.map((a) => ({ ...a, included: true, whatIfMonthly: null })));
   const removeAccount = (id) => setAccounts((prev) => prev.filter((a) => a.id !== id));
 
   const updateExpense = (id, field, val) => setExpenses((prev) => prev.map((e) => (e.id === id ? { ...e, [field]: val } : e)));
@@ -1630,12 +1648,30 @@ function RetirementRunwayV4() {
           </button>
           <div style={{ fontSize: "11px", color: MUTED, marginBottom: expanded.accountsPanel ? "10px" : "0" }} className="rr-mono">
             Total: {fmtMoney(currentMonthlyContribution)}/mo · {fmtPct((currentAnnualContribution / Number(salary)) * 100)} of gross
+            {scenarioActive && (
+              <span style={{ color: BRASS }}> · what-if scenario (actual {fmtMoney(baseMonthlyContribution)}/mo)</span>
+            )}
           </div>
           {expanded.accountsPanel && (
           <>
-          {accounts.map((a) => (
-            <div key={a.id} style={{ border: `1px solid ${GRID}`, borderRadius: "4px", padding: "10px", marginBottom: "8px" }}>
-              <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+          <div style={{ fontSize: "11px", color: MUTED, marginBottom: "10px", lineHeight: 1.5 }}>
+            Uncheck an account to see your plan without it, or set a what-if amount to try a different
+            contribution — your real numbers stay saved underneath.
+          </div>
+          {accounts.map((a) => {
+            const included = a.included !== false;
+            const whatIf = hasWhatIf(a);
+            return (
+            <div key={a.id} data-account-card style={{ border: `1px solid ${whatIf && included ? BRASS : GRID}`, borderRadius: "4px", padding: "10px", marginBottom: "8px", opacity: included ? 1 : 0.5 }}>
+              <div style={{ display: "flex", gap: "6px", marginBottom: "6px", alignItems: "center" }}>
+                <input
+                  type="checkbox"
+                  aria-label={`Include ${a.label} in plan`}
+                  title={included ? "Included in the plan — uncheck to see your plan without this account" : "Excluded from the plan — check to add it back"}
+                  checked={included}
+                  onChange={(e) => updateAccount(a.id, "included", e.target.checked)}
+                  style={{ width: "16px", height: "16px", flexShrink: 0, cursor: "pointer", accentColor: BRASS }}
+                />
                 <input type="text" value={a.label} onChange={(e) => updateAccount(a.id, "label", e.target.value)} style={{ flex: 1, fontFamily: "Inter", fontSize: "12px" }} />
                 <button className="rr-x-btn" onClick={() => removeAccount(a.id)}>×</button>
               </div>
@@ -1650,8 +1686,27 @@ function RetirementRunwayV4() {
               <select value={a.type} onChange={(e) => updateAccount(a.id, "type", e.target.value)} style={{ marginTop: "6px" }}>
                 {ACCOUNT_TYPES.map((t) => (<option key={t.key} value={t.key}>{t.label}</option>))}
               </select>
+              {!included ? (
+                <div className="rr-mono" style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>Excluded from this scenario</div>
+              ) : whatIf ? (
+                <div style={{ marginTop: "6px" }}>
+                  <span className="rr-field-label" style={{ color: BRASS }}>What-if amount (actual {fmtMoney(Number(a.monthly || 0))}/mo)</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
+                    <input type="number" aria-label={`What-if monthly amount for ${a.label}`} value={a.whatIfMonthly} onChange={(e) => updateAccount(a.id, "whatIfMonthly", Number(e.target.value))} />
+                    <span className="rr-mono" style={{ fontSize: "11px", color: MUTED }}>/mo</span>
+                    <button className="rr-x-btn" title="Clear what-if amount" onClick={() => updateAccount(a.id, "whatIfMonthly", null)}>×</button>
+                  </div>
+                </div>
+              ) : (
+                <button className="rr-add-btn" style={{ marginTop: "6px", padding: "5px" }} onClick={() => updateAccount(a.id, "whatIfMonthly", Number(a.monthly || 0))}>try a different amount</button>
+              )}
             </div>
-          ))}
+            );
+          })}
+          {scenarioActive && (
+            <button className="rr-add-btn" style={{ marginBottom: "6px", color: BRASS, borderColor: BRASS }} onClick={resetAccountScenario}>↺ reset what-if scenario (include all, use actual amounts)</button>
+          )}
           <button className="rr-add-btn" onClick={addAccount}>+ add account</button>
           </>
           )}

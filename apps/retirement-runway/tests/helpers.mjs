@@ -94,6 +94,7 @@ export async function expandEverything(page) {
     'Not estimated — tap to add',
     'Not modeled — tap to add',
     'Not stress-tested — tap to add',
+    'try a different amount', // Your Accounts: reveals each account's what-if amount input
   ];
   // Several sections (IRMAA/RMD/NIIT/ACA) share identical toggle copy, so more than one button can
   // match a given label — loop until none remain instead of clicking only the first.

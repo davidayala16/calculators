@@ -138,6 +138,48 @@ test('removing all accounts/expenses does not crash the app', { timeout: TEST_TI
   await browser.close();
 });
 
+test('Your Accounts what-if: excluding an account and overriding an amount, then resetting', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const card = page.locator('[data-account-card]').first();
+  const monthly = card.locator('input[type="number"]').first();
+  await monthly.fill('1000');
+  const totalLine = page.locator('text=/^Total: /').first();
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$1,000\/mo/);
+
+  // exclude the account: it drops out of the math, but its real amount is kept
+  await card.locator('input[type="checkbox"]').uncheck();
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$0\/mo.*what-if scenario \(actual \$1,000\/mo\)/);
+  assert.equal(await monthly.inputValue(), '1000');
+
+  // include it again with a different what-if amount
+  await card.locator('input[type="checkbox"]').check();
+  await card.locator('button:has-text("try a different amount")').click();
+  await card.locator('input[aria-label^="What-if monthly amount"]').fill('250');
+  await page.waitForTimeout(700); // past the autosave debounce
+  assert.match(await totalLine.innerText(), /Total: \$250\/mo/);
+  const saved = JSON.parse(await page.evaluate(() => localStorage.getItem('retirement-runway:autosave-v1')));
+  assert.equal(saved.accounts[0].whatIfMonthly, 250);
+  assert.equal(saved.accounts[0].monthly, 1000);
+
+  // reset restores the actual amounts
+  await page.click('button:has-text("reset what-if scenario")');
+  await page.waitForTimeout(100);
+  assert.match(await totalLine.innerText(), /Total: \$1,000\/mo/);
+  assert.doesNotMatch(await totalLine.innerText(), /what-if/);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
 test('autosaves to localStorage and restores after a genuine browser restart', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();
