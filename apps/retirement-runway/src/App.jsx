@@ -75,6 +75,45 @@ function safeNum(v) {
   const n = Number(v);
   return isFinite(n) ? n : 0;
 }
+// A contribution "gap" on an account: a period where it contributes a different monthly amount
+// ($0 = full pause). Start and length each take any number plus a unit, so any timeline can be
+// described; the quick-pick lengths in the UI are only shortcuts that fill those fields in.
+const GAP_START_UNITS = [
+  { value: "monthsFromNow", label: "months from now" },
+  { value: "yearsFromNow", label: "years from now" },
+  { value: "age", label: "at age" },
+];
+const GAP_LENGTH_UNITS = [
+  { value: "months", label: "months" },
+  { value: "years", label: "years" },
+  { value: "retirement", label: "until retirement" },
+];
+const GAP_QUICK_LENGTHS = [
+  { label: "1 mo", lengthValue: 1, lengthUnit: "months" }, { label: "3 mo", lengthValue: 3, lengthUnit: "months" },
+  { label: "6 mo", lengthValue: 6, lengthUnit: "months" }, { label: "1 yr", lengthValue: 1, lengthUnit: "years" },
+  { label: "2 yr", lengthValue: 2, lengthUnit: "years" }, { label: "5 yr", lengthValue: 5, lengthUnit: "years" },
+  { label: "until retirement", lengthValue: 1, lengthUnit: "retirement" },
+];
+function accountGaps(a) {
+  return a && Array.isArray(a.gaps) ? a.gaps.filter((g) => g && typeof g === "object") : [];
+}
+// Resolve a gap's fields to { start, end } in whole months from today (start floored at 0).
+function gapWindow(g, currentAge) {
+  const sv = safeNum(g.startValue);
+  const rawStart = g.startUnit === "age" ? (sv - safeNum(currentAge)) * 12 : g.startUnit === "yearsFromNow" ? sv * 12 : sv;
+  const start = Math.min(Math.max(Math.round(rawStart), 0), MAX_YEARS * 12);
+  if (g.lengthUnit === "retirement") return { start, end: Infinity };
+  const lv = Math.max(safeNum(g.lengthValue), 0);
+  const len = Math.min(Math.round(g.lengthUnit === "years" ? lv * 12 : lv), MAX_YEARS * 12);
+  return { start, end: start + len };
+}
+function fmtAge(x) {
+  if (!isFinite(x)) return "—";
+  let y = Math.floor(x);
+  let m = Math.round((x - y) * 12);
+  if (m === 12) { y += 1; m = 0; }
+  return m ? `${y}y ${m}m` : `${y}`;
+}
 function hasWhatIf(a) {
   return a && a.whatIfMonthly !== null && a.whatIfMonthly !== undefined && a.whatIfMonthly !== "" && isFinite(Number(a.whatIfMonthly));
 }
@@ -91,6 +130,7 @@ function toNominal(realPct, inflationPct) { return ((1 + realPct / 100) * (1 + i
 function simulateRaiseSchedule({
   currentBalance, salary, raisePct, matureRaisePct = null, raiseSlowdownYears = null, salaryCap = null,
   startContribution, raiseAllocationPct, realPreReturn, years, stopContributingYear = Infinity,
+  contributionGaps = [],
 }) {
   years = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS);
   const monthlyRate = realPreReturn / 100 / 12;
@@ -98,10 +138,29 @@ function simulateRaiseSchedule({
   let sal = salary;
   let annualContribution = startContribution;
   const points = [{ t: 0, balance }];
+  let contributed = 0;
   for (let y = 0; y < years; y++) {
     const monthlyContribution = (y < stopContributingYear ? annualContribution : 0) / 12;
     for (let m = 0; m < 12; m++) {
-      balance = Math.min(balance * (1 + monthlyRate) + monthlyContribution, MAX_BALANCE);
+      // contributionGaps: [{ accountId, start, end, delta }] in months from today — a stretch where
+      // one account contributes a different amount (delta = new − usual; a full pause is −usual).
+      // The balance keeps compounding through a pause; only the new money changes. If two periods
+      // on the same account overlap, the one listed later wins, so changes never double-count.
+      let change = 0;
+      if (contributionGaps.length && y < stopContributingYear) {
+        const k = y * 12 + m;
+        let seen = null;
+        for (let i = contributionGaps.length - 1; i >= 0; i--) {
+          const g = contributionGaps[i];
+          if (k < g.start || k >= g.end) continue;
+          if (seen && seen.has(g.accountId)) continue;
+          (seen || (seen = new Set())).add(g.accountId);
+          change += g.delta;
+        }
+      }
+      const thisMonth = Math.min(Math.max(monthlyContribution + change, 0), MAX_BALANCE);
+      contributed = Math.min(contributed + thisMonth, MAX_BALANCE);
+      balance = Math.min(balance * (1 + monthlyRate) + thisMonth, MAX_BALANCE);
     }
     const effectiveRaisePct = raiseSlowdownYears !== null && y >= raiseSlowdownYears ? matureRaisePct : raisePct;
     const raiseAmt = sal * (effectiveRaisePct / 100);
@@ -110,7 +169,7 @@ function simulateRaiseSchedule({
     if (salaryCap && salaryCap > 0) sal = Math.min(sal, salaryCap);
     points.push({ t: y + 1, balance });
   }
-  return { finalBalance: balance, points };
+  return { finalBalance: balance, points, contributed };
 }
 
 function simulateFlatSchedule({ currentBalance, flatAnnual, realPreReturn, years }) {
@@ -791,7 +850,7 @@ function RetirementRunwayV4() {
   const accountsBalanceTotal = activeAccounts.reduce((s, a) => s + safeNum(a.balance), 0);
   const startingBalance = Math.min(Math.max(safeNum(currentBalance) + accountsBalanceTotal, -MAX_BALANCE), MAX_BALANCE);
   const baseBalanceTotal = (Array.isArray(accounts) ? accounts : []).reduce((s, a) => s + safeNum(a && a.balance), 0);
-  const scenarioActive = (Array.isArray(accounts) ? accounts : []).some((a) => a && (a.included === false || hasWhatIf(a)));
+  const scenarioActive = (Array.isArray(accounts) ? accounts : []).some((a) => a && (a.included === false || hasWhatIf(a) || accountGaps(a).length > 0));
 
   const currentAnnualContribution = activeAccounts.reduce((s, a) => s + Number(a.monthly || 0), 0) * 12;
   const currentMonthlyContribution = currentAnnualContribution / 12;
@@ -820,16 +879,38 @@ function RetirementRunwayV4() {
     raiseSlowdownYears: useRaiseSlowdown ? Number(raiseSlowdownYears) : null,
     salaryCap: useSalaryCap ? Number(salaryCap) : null,
   };
+  // Every contribution change on every included account, resolved to months from today.
+  const contributionGaps = useMemo(() => activeAccounts.flatMap((a) => accountGaps(a).map((g) => {
+    const { start, end } = gapWindow(g, currentAge);
+    const usual = Math.max(safeNum(a.monthly), 0);
+    const during = Math.max(safeNum(g.monthlyDuring), 0);
+    return { accountId: a.id, start, end, delta: during - usual };
+  })).filter((g) => g.end > g.start && g.delta !== 0), [activeAccounts, currentAge]);
   const stopContributingYear = useStopContributing ? Math.max(Number(stopContributingAge) - Number(currentAge), 0) : Infinity;
 
   const schedule = useMemo(
     () => simulateRaiseSchedule({
       currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
-      ...careerParams, stopContributingYear,
+      ...careerParams, stopContributingYear, contributionGaps,
     }),
-    [startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]
+    [startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]
   );
+
+  // What the timeline changes do: the same projection with none of them, compared with the real one.
+  // Null when nothing actually changes before retirement (e.g. a gap that starts after it).
+  const gapImpact = useMemo(() => {
+    if (contributionGaps.length === 0) return null;
+    const without = simulateRaiseSchedule({
+      currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
+      startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
+      ...careerParams, stopContributingYear, contributionGaps: [],
+    });
+    const contributionChange = schedule.contributed - without.contributed;
+    const balanceChange = schedule.finalBalance - without.finalBalance;
+    if (Math.abs(contributionChange) < 0.5 && Math.abs(balanceChange) < 0.5) return null;
+    return { contributionChange, balanceChange, withoutGaps: without.finalBalance };
+  }, [contributionGaps, schedule, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   const target = targetMode === "fixed" ? Number(fixedTarget) : expensePre65 / (Math.max(Number(withdrawalRate), 0.1) / 100);
 
@@ -845,10 +926,10 @@ function RetirementRunwayV4() {
     const fn = (pct) => simulateRaiseSchedule({
       currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: pct, realPreReturn, years,
-      ...careerParams, stopContributingYear,
+      ...careerParams, stopContributingYear, contributionGaps,
     }).finalBalance;
     return solveForTarget(fn, 0, 100, target);
-  }, [startingBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [startingBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
 
   const requiredFlatMonthly = useMemo(() => {
     const fn = (flatMonthly) => simulateFlatSchedule({ currentBalance: startingBalance, flatAnnual: flatMonthly * 12, realPreReturn, years });
@@ -878,11 +959,11 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: yrs,
-        ...careerParams, stopContributingYear,
+        ...careerParams, stopContributingYear, contributionGaps,
       });
       return { age, balance: s.finalBalance, gap: s.finalBalance - target };
     });
-  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
 
   const gap = schedule.finalBalance - target;
   const rothAdvantagePct = ((1 - Number(currentMarginalRate) / 100) / (1 - Number(retirementMarginalRate) / 100) - 1) * 100;
@@ -929,12 +1010,12 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
-        ...careerParams, stopContributingYear,
+        ...careerParams, stopContributingYear, contributionGaps,
       });
       if (s.finalBalance >= fiNumber) return age;
     }
     return null;
-  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
 
   const coastFireAge = useMemo(() => {
     // total trip count clamped to MAX_YEARS regardless of how extreme currentAge/retireAge are
@@ -947,13 +1028,13 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
-        ...careerParams, stopContributingYear,
+        ...careerParams, stopContributingYear, contributionGaps,
       });
       const coastedToRetirement = s.finalBalance * Math.pow(1 + realPreReturn / 100, Number(retireAge) - age);
       if (coastedToRetirement >= target) return age;
     }
     return null;
-  }, [currentAge, retireAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+  }, [currentAge, retireAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
 
   // Withdrawal order: group accounts by tax treatment present, suggest a standard sequence
   const withdrawalOrderGroups = useMemo(() => {
@@ -979,11 +1060,22 @@ function RetirementRunwayV4() {
     return activeAccounts.map((a) => {
       const bal = Math.max(safeNum(a.balance), 0);
       const mo = Math.max(safeNum(a.monthly), 0);
-      const fvContrib = Math.abs(mr) < 1e-12 ? mo * months : mo * (growth - 1) / mr;
+      const own = contributionGaps.filter((g) => g.accountId === a.id);
+      let fvContrib;
+      if (own.length === 0) {
+        fvContrib = Math.abs(mr) < 1e-12 ? mo * months : mo * (growth - 1) / mr;
+      } else {
+        fvContrib = 0;
+        for (let k = 0; k < months; k++) {
+          let amt = mo;
+          for (let i = own.length - 1; i >= 0; i--) if (k >= own[i].start && k < own[i].end) { amt = Math.max(mo + own[i].delta, 0); break; }
+          fvContrib = Math.min(fvContrib * (1 + mr) + amt, MAX_BALANCE);
+        }
+      }
       const w = bal * growth + fvContrib;
       return { treatment: a.treatment, weight: isFinite(w) ? Math.min(Math.max(w, 0), MAX_BALANCE) : MAX_BALANCE };
     });
-  }, [activeAccounts, realPreReturn, years]);
+  }, [activeAccounts, realPreReturn, years, contributionGaps]);
 
   // The projection itself runs on one blended balance; this split only approximates its tax
   // composition. Falls back in two stages when there's nothing to weight by (every account at $0
@@ -1379,6 +1471,15 @@ function RetirementRunwayV4() {
     });
   }, [activeAccounts, hsaCoverage]);
 
+  const addGap = (accountId) => setAccounts((prev) => prev.map((a) => (a.id === accountId
+    ? { ...a, gaps: [...accountGaps(a), { id: `gap${idCounter++}`, startValue: 0, startUnit: "monthsFromNow", lengthValue: 1, lengthUnit: "years", monthlyDuring: 0 }] }
+    : a)));
+  const updateGap = (accountId, gapId, patch) => setAccounts((prev) => prev.map((a) => (a.id === accountId
+    ? { ...a, gaps: accountGaps(a).map((g) => (g.id === gapId ? { ...g, ...patch } : g)) }
+    : a)));
+  const removeGap = (accountId, gapId) => setAccounts((prev) => prev.map((a) => (a.id === accountId
+    ? { ...a, gaps: accountGaps(a).filter((g) => g.id !== gapId) }
+    : a)));
   const updateAccount = (id, field, val) => setAccounts((prev) => prev.map((a) => (a.id === id ? { ...a, [field]: val } : a)));
   const addAccount = () => setAccounts((prev) => [...prev, { id: `acc${idCounter++}`, label: "New account", balance: 0, monthly: 0, treatment: "Roth (after-tax)", type: "other" }]);
 
@@ -1409,7 +1510,7 @@ function RetirementRunwayV4() {
     // not touching the URL here either — same reasoning as above. If you want to share the
     // blank state, hit "Copy shareable link" afterward to generate a fresh one on demand.
   };
-  const resetAccountScenario = () => setAccounts((prev) => prev.map((a) => ({ ...a, included: true, whatIfMonthly: null })));
+  const resetAccountScenario = () => setAccounts((prev) => prev.map((a) => ({ ...a, included: true, whatIfMonthly: null, gaps: [] })));
   const removeAccount = (id) => setAccounts((prev) => prev.filter((a) => a.id !== id));
 
   const updateExpense = (id, field, val) => setExpenses((prev) => prev.map((e) => (e.id === id ? { ...e, [field]: val } : e)));
@@ -1686,8 +1787,8 @@ function RetirementRunwayV4() {
           <>
           <div style={{ fontSize: "11px", color: MUTED, marginBottom: "10px", lineHeight: 1.5 }}>
             Uncheck an account to see your plan without it (its balance and contributions both drop out),
-            or set a what-if amount to try a different monthly contribution — your real numbers stay
-            saved underneath.
+            add gaps to pause or change its contributions for any stretch of time, or set a what-if
+            amount to try a different monthly contribution — your real numbers stay saved underneath.
           </div>
           {accounts.map((a) => {
             const included = a.included !== false;
@@ -1729,6 +1830,61 @@ function RetirementRunwayV4() {
               <select value={a.type} onChange={(e) => updateAccount(a.id, "type", e.target.value)} style={{ marginTop: "6px" }}>
                 {ACCOUNT_TYPES.map((t) => (<option key={t.key} value={t.key}>{t.label}</option>))}
               </select>
+              {included && accountGaps(a).map((g, gi) => {
+                const { start, end } = gapWindow(g, currentAge);
+                const startAge = safeNum(currentAge) + start / 12;
+                const endAge = end === Infinity ? Number(retireAge) : safeNum(currentAge) + end / 12;
+                const usual = whatIf ? Number(a.whatIfMonthly) : safeNum(a.monthly);
+                const during = Math.max(safeNum(g.monthlyDuring), 0);
+                return (
+                <div key={g.id} data-gap-box style={{ marginTop: "6px", border: `1px dashed ${BRASS}`, borderRadius: "3px", padding: "8px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
+                    <span className="rr-field-label" style={{ color: BRASS, margin: 0, flex: 1 }}>{during === 0 ? "Pause" : "Contribution change"} {accountGaps(a).length > 1 ? `#${gi + 1}` : ""}</span>
+                    <button className="rr-x-btn" title="Remove this gap" onClick={() => removeGap(a.id, g.id)}>×</button>
+                  </div>
+                  <span className="rr-field-label">Starts</span>
+                  <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                    <input type="number" step="any" aria-label={`Gap start for ${a.label}`} value={g.startValue} onChange={(e) => updateGap(a.id, g.id, { startValue: e.target.value })} style={{ flex: 1, minWidth: 0 }} />
+                    <select aria-label={`Gap start unit for ${a.label}`} value={g.startUnit} onChange={(e) => updateGap(a.id, g.id, { startUnit: e.target.value })} style={{ flex: 1.4, minWidth: 0 }}>
+                      {GAP_START_UNITS.map((u) => (<option key={u.value} value={u.value}>{u.label}</option>))}
+                    </select>
+                  </div>
+                  <span className="rr-field-label">Lasts</span>
+                  <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                    {g.lengthUnit !== "retirement" && (
+                      <input type="number" step="any" aria-label={`Gap length for ${a.label}`} value={g.lengthValue} onChange={(e) => updateGap(a.id, g.id, { lengthValue: e.target.value })} style={{ flex: 1, minWidth: 0 }} />
+                    )}
+                    <select aria-label={`Gap length unit for ${a.label}`} value={g.lengthUnit} onChange={(e) => updateGap(a.id, g.id, { lengthUnit: e.target.value })} style={{ flex: 1.4, minWidth: 0 }}>
+                      {GAP_LENGTH_UNITS.map((u) => (<option key={u.value} value={u.value}>{u.label}</option>))}
+                    </select>
+                  </div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: "4px", marginBottom: "8px" }}>
+                    {GAP_QUICK_LENGTHS.map((q) => {
+                      const on = g.lengthUnit === q.lengthUnit && (q.lengthUnit === "retirement" || safeNum(g.lengthValue) === q.lengthValue);
+                      return (
+                        <button key={q.label} className={`rr-toggle ${on ? "active" : ""}`} style={{ padding: "3px 7px", fontSize: "11px" }} onClick={() => updateGap(a.id, g.id, { lengthValue: q.lengthValue, lengthUnit: q.lengthUnit })}>{q.label}</button>
+                      );
+                    })}
+                  </div>
+                  <span className="rr-field-label">Contribute during it ($0 = full pause)</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: "4px" }}>
+                    <span className="rr-mono" style={{ fontSize: "12px", color: MUTED }}>$</span>
+                    <input type="number" aria-label={`Contribution during gap for ${a.label}`} value={g.monthlyDuring} onChange={(e) => updateGap(a.id, g.id, { monthlyDuring: e.target.value })} />
+                    <span className="rr-mono" style={{ fontSize: "11px", color: MUTED }}>/mo</span>
+                  </div>
+                  <div className="rr-mono" style={{ fontSize: "11px", color: MUTED, marginTop: "6px", lineHeight: 1.5 }}>
+                    {start >= years * 12 || end <= start
+                      ? "Falls after retirement (or has no length), so it doesn't change the plan."
+                      : `Age ${fmtAge(startAge)} → ${end === Infinity || endAge >= Number(retireAge) ? `retirement (${retireAge})` : fmtAge(endAge)}: ${fmtMoney(during)}/mo instead of ${fmtMoney(usual)}/mo. The balance stays invested throughout.`}
+                  </div>
+                </div>
+                );
+              })}
+              {included && (
+                <button className="rr-add-btn" style={{ marginTop: "6px", padding: "5px" }} onClick={() => addGap(a.id)}>
+                  {accountGaps(a).length === 0 ? "pause contributions (gap)" : "+ add another gap"}
+                </button>
+              )}
               {!included ? (
                 <div className="rr-mono" style={{ fontSize: "11px", color: MUTED, marginTop: "6px" }}>Excluded from this scenario</div>
               ) : whatIf ? (
@@ -1747,6 +1903,23 @@ function RetirementRunwayV4() {
             </div>
             );
           })}
+          {gapImpact && (
+            <div data-gap-impact style={{ border: `1px solid ${BRASS}`, borderRadius: "4px", padding: "10px", marginBottom: "8px", background: PANEL_2 }}>
+              <div className="rr-mono" style={{ fontSize: "13px", color: gapImpact.balanceChange < 0 ? RUST : TEAL, fontWeight: 600, marginBottom: "4px" }}>
+                {gapImpact.balanceChange < 0
+                  ? `Gap cost: ${fmtMoney(-gapImpact.balanceChange)} by age ${retireAge}`
+                  : `Extra contributions add ${fmtMoney(gapImpact.balanceChange)} by age ${retireAge}`}
+              </div>
+              <div style={{ fontSize: "12px", color: MUTED, lineHeight: 1.5 }}>
+                {gapImpact.contributionChange < 0
+                  ? `You'd put in ${fmtMoney(-gapImpact.contributionChange)} less`
+                  : `You'd put in ${fmtMoney(gapImpact.contributionChange)} more`}
+                , which changes your balance at retirement from {fmtMoney(gapImpact.withoutGaps)} to {fmtMoney(schedule.finalBalance)} (today's
+                dollars) because that money also {gapImpact.contributionChange < 0 ? "misses out on" : "gets"} its growth.
+                {Math.abs(gapImpact.contributionChange) >= 1 && ` Every $1 ${gapImpact.contributionChange < 0 ? "skipped costs" : "added is worth"} about $${(Math.abs(gapImpact.balanceChange) / Math.abs(gapImpact.contributionChange)).toFixed(2)} at retirement.`}
+              </div>
+            </div>
+          )}
           {scenarioActive && (
             <button className="rr-add-btn" style={{ marginBottom: "6px", color: BRASS, borderColor: BRASS }} onClick={resetAccountScenario}>↺ reset what-if scenario (include all, use actual amounts)</button>
           )}

@@ -232,6 +232,83 @@ test('a profile saved before per-account balances keeps its total as "other savi
   await browser.close();
 });
 
+test('contribution gaps: custom start/length/amount, several per account, gap cost, and reset', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const card = page.locator('[data-account-card]').first();
+  await card.locator('input[aria-label^="Current balance"]').fill('50000');
+  await card.locator('input[aria-label^="Monthly contribution"]').fill('1000');
+  const impact = page.locator('[data-gap-impact]');
+  const costOf = async () => {
+    await page.waitForTimeout(100);
+    const m = (await impact.innerText()).match(/Gap cost: \$([\d,]+)/);
+    return Number(m[1].replace(/,/g, ''));
+  };
+
+  // default gap: full pause, starting now, for 1 year — skips $12,000 and costs more than that
+  await card.locator('button:has-text("pause contributions (gap)")').click();
+  await page.waitForTimeout(100);
+  assert.match(await impact.innerText(), /put in \$12,000 less/);
+  const oneYear = await costOf();
+  assert.ok(oneYear > 12000, `growth should make a 1-year gap cost more than $12,000, got ${oneYear}`);
+  assert.match(await page.locator('[data-starting-balance]').innerText(), /Starting balance: \$50,000/);
+
+  // fully custom length: 7 months
+  await card.locator('input[aria-label^="Gap length for"]').fill('7');
+  await card.locator('select[aria-label^="Gap length unit"]').selectOption('months');
+  assert.match(await impact.innerText(), /put in \$7,000 less/);
+
+  // a partial cut instead of a full pause: $400/mo during 7 months → $4,200 less
+  await card.locator('input[aria-label^="Contribution during gap"]').fill('400');
+  await page.waitForTimeout(100);
+  assert.match(await impact.innerText(), /put in \$4,200 less/);
+
+  // a gap that starts after retirement changes nothing, and the impact box goes away
+  await card.locator('select[aria-label^="Gap start unit"]').selectOption('age');
+  await card.locator('input[aria-label^="Gap start for"]').fill('70');
+  await page.waitForTimeout(100);
+  assert.equal(await impact.count(), 0);
+
+  // a second gap on the same account: a quick-pick "1 yr" full pause starting 2.5 years from now
+  await card.locator('input[aria-label^="Gap start for"]').first().fill('40');
+  await card.locator('button:has-text("+ add another gap")').click();
+  const second = card.locator('[data-gap-box]').nth(1);
+  await second.locator('input[aria-label^="Gap start for"]').fill('2.5');
+  await second.locator('select[aria-label^="Gap start unit"]').selectOption('yearsFromNow');
+  await second.locator('button:has-text("1 yr")').click();
+  await page.waitForTimeout(100);
+  // first gap (7 mo at $400, from age 40) = $4,200 less; second (12 mo at $0) = $12,000 less
+  assert.match(await impact.innerText(), /put in \$16,200 less/);
+
+  // "until retirement" is the most expensive pause
+  await second.locator('button:has-text("until retirement")').click();
+  const untilRetirement = await costOf();
+  assert.ok(untilRetirement > oneYear);
+
+  // a catch-up period (more than usual) shows as a gain, not a cost
+  await card.locator('[data-gap-box]').nth(1).locator('.rr-x-btn').click();
+  await card.locator('input[aria-label^="Contribution during gap"]').fill('3000');
+  await page.waitForTimeout(700);
+  assert.match(await impact.innerText(), /Extra contributions add/);
+  const saved = JSON.parse(await page.evaluate(() => localStorage.getItem('retirement-runway:autosave-v1')));
+  assert.equal(saved.accounts[0].gaps.length, 1);
+  assert.equal(saved.accounts[0].gaps[0].monthlyDuring, '3000');
+
+  await page.click('button:has-text("reset what-if scenario")');
+  await page.waitForTimeout(100);
+  assert.equal(await page.locator('[data-gap-box]').count(), 0);
+  assert.equal(await impact.count(), 0);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
 test('autosaves to localStorage and restores after a genuine browser restart', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();

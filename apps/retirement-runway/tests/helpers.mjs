@@ -95,6 +95,7 @@ export async function expandEverything(page) {
     'Not modeled — tap to add',
     'Not stress-tested — tap to add',
     'try a different amount', // Your Accounts: reveals each account's what-if amount input
+    'pause contributions (gap)', // Your Accounts: adds a gap (start/length/amount inputs) to each account
   ];
   // Several sections (IRMAA/RMD/NIIT/ACA) share identical toggle copy, so more than one button can
   // match a given label — loop until none remain instead of clicking only the first.
