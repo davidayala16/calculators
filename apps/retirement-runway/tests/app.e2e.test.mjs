@@ -309,6 +309,38 @@ test('contribution gaps: custom start/length/amount, several per account, gap co
   await browser.close();
 });
 
+// Dollar values below were cross-checked against an independent textbook calculation (10% nominal,
+// 3% inflation, age 30 -> 65). They pin two fixes: the monthly rate is the exact 12th root of the
+// annual real return (not annual / 12, which overstated growth), and a full pause also stops the
+// account's share of "% of raise -> retirement" money.
+test('gap math: exact monthly compounding, and a full pause also stops raise-allocated money', { timeout: TEST_TIMEOUT_MS }, async (t) => {
+  const browser = await launchBrowser();
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  const errors = collectErrors(page);
+  await page.goto(BASE_URL, { waitUntil: 'networkidle' });
+
+  const card = page.locator('[data-account-card]').first();
+  await card.locator('input[aria-label^="Current balance"]').fill('50000');
+  await card.locator('input[aria-label^="Monthly contribution"]').fill('1000');
+  await card.locator('button:has-text("pause contributions (gap)")').click();
+  await page.waitForTimeout(150);
+  const impact = page.locator('[data-gap-impact]');
+  // 1-year full pause, no raise money: $2,135,072 -> $2,019,398
+  assert.match(await impact.innerText(), /from \$2,135,072 to \$2,019,398/);
+
+  // with 50% of raises going to retirement, pausing until retirement leaves only the $50k growing
+  await page.locator('span.rr-field-label:has-text("% of raise") + input').fill('50');
+  await card.locator('select[aria-label^="Gap length unit"]').selectOption('retirement');
+  await page.waitForTimeout(150);
+  assert.match(await impact.innerText(), /from \$4,327,702 to \$499,357/);
+
+  assert.equal(await isShowingErrorBoundary(page), false);
+  assert.deepEqual(errors, []);
+  await context.close();
+  await browser.close();
+});
+
 test('autosaves to localStorage and restores after a genuine browser restart', { timeout: TEST_TIMEOUT_MS }, async (t) => {
   const browser = await launchBrowser();
   const context = await browser.newContext();
