@@ -107,6 +107,23 @@ function gapWindow(g, currentAge) {
   const len = Math.min(Math.round(g.lengthUnit === "years" ? lv * 12 : lv), MAX_YEARS * 12);
   return { start, end: start + len };
 }
+// Market events (before retirement): a start and length like a gap, plus a return given either
+// per year or as a total change over the whole event.
+const MARKET_RETURN_MODES = [
+  { value: "perYear", label: "% per year" },
+  { value: "total", label: "% total over the event" },
+];
+// Each preset adds one or more events; `after` (years) offsets a part from the preset's start.
+const MARKET_PRESETS = [
+  { label: "Crash & rebound: −35%, then +25%/yr for 2 yrs", parts: [
+    { after: 0, returnPct: -35, returnMode: "total", lengthValue: 1, lengthUnit: "years" },
+    { after: 1, returnPct: 25, returnMode: "perYear", lengthValue: 2, lengthUnit: "years" },
+  ] },
+  { label: "Crash: −35% over 1 yr", parts: [{ after: 0, returnPct: -35, returnMode: "total", lengthValue: 1, lengthUnit: "years" }] },
+  { label: "Bear market: −15%/yr for 2 yrs", parts: [{ after: 0, returnPct: -15, returnMode: "perYear", lengthValue: 2, lengthUnit: "years" }] },
+  { label: "Lost decade: 0%/yr for 10 yrs", parts: [{ after: 0, returnPct: 0, returnMode: "perYear", lengthValue: 10, lengthUnit: "years" }] },
+  { label: "Boom: +25%/yr for 2 yrs", parts: [{ after: 0, returnPct: 25, returnMode: "perYear", lengthValue: 2, lengthUnit: "years" }] },
+];
 function fmtAge(x) {
   if (!isFinite(x)) return "—";
   let y = Math.floor(x);
@@ -136,7 +153,7 @@ function monthlyRateFor(annualPct) {
 function simulateRaiseSchedule({
   currentBalance, salary, raisePct, matureRaisePct = null, raiseSlowdownYears = null, salaryCap = null,
   startContribution, raiseAllocationPct, realPreReturn, years, stopContributingYear = Infinity,
-  contributionGaps = [],
+  contributionGaps = [], marketEvents = [],
 }) {
   years = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS);
   const monthlyRate = monthlyRateFor(realPreReturn);
@@ -168,7 +185,17 @@ function simulateRaiseSchedule({
       }
       const thisMonth = Math.min(Math.max(monthlyContribution + change, 0), MAX_BALANCE);
       contributed = Math.min(contributed + thisMonth, MAX_BALANCE);
-      balance = Math.min(balance * (1 + monthlyRate) + thisMonth, MAX_BALANCE);
+      // marketEvents: [{ start, end, monthlyRate }] in months from today — a stretch where the market
+      // returns something other than the steady pre-retirement rate (a crash, a boom). Later wins.
+      let rate = monthlyRate;
+      if (marketEvents.length) {
+        const k = y * 12 + m;
+        for (let i = marketEvents.length - 1; i >= 0; i--) {
+          const ev = marketEvents[i];
+          if (k >= ev.start && k < ev.end) { rate = ev.monthlyRate; break; }
+        }
+      }
+      balance = Math.min(Math.max(balance * (1 + rate) + thisMonth, -MAX_BALANCE), MAX_BALANCE);
     }
     const effectiveRaisePct = raiseSlowdownYears !== null && y >= raiseSlowdownYears ? matureRaisePct : raisePct;
     const raiseAmt = sal * (effectiveRaisePct / 100);
@@ -615,6 +642,7 @@ function RetirementRunwayV4() {
   const [fixedTarget, setFixedTarget] = useState(2000000);
 
   const [accounts, setAccounts] = useState(DEFAULT_ACCOUNTS);
+  const [marketEvents, setMarketEvents] = useState([]);
   const [expenses, setExpenses] = useState(DEFAULT_EXPENSES);
   const [healthcarePre65, setHealthcarePre65] = useState(0);
   const [healthcarePost65, setHealthcarePost65] = useState(0);
@@ -746,6 +774,7 @@ function RetirementRunwayV4() {
     if (p.estateState !== undefined) setEstateState(p.estateState);
     if (p.numberOfKids !== undefined) setNumberOfKids(p.numberOfKids);
     if (p.legacyWithdrawalSplit !== undefined) setLegacyWithdrawalSplit(p.legacyWithdrawalSplit);
+    if (Array.isArray(p.marketEvents)) setMarketEvents(p.marketEvents.filter((e) => e && typeof e === "object"));
   };
 
   const encodeProfile = (obj) => {
@@ -812,6 +841,7 @@ function RetirementRunwayV4() {
     includeWidowTorpedo, survivorEventAge, survivorSsReductionPct, healthcareInflation, capGainsMode,
     includePartTime, partTimeStartAge, fullRetirementAge, partTimeIncome, partTimeMode, partTimeContributionPct,
     includeLegacy, heirsMarginalRate, estateState, numberOfKids, legacyWithdrawalSplit,
+    marketEvents,
   };
 
   // Autosave to localStorage, debounced so rapid typing doesn't hit disk on every keystroke.
@@ -901,13 +931,36 @@ function RetirementRunwayV4() {
   }, [activeAccounts, currentAge]);
   const stopContributingYear = useStopContributing ? Math.max(Number(stopContributingAge) - Number(currentAge), 0) : Infinity;
 
+  // Market events resolved to real monthly rates. Returns are entered in the same terms as the main
+  // return inputs (nominal or real); nominal ones are converted with the inflation input.
+  const marketPath = useMemo(() => {
+    const horizonMonths = Math.min(Math.max(Math.trunc(years) || 0, 0), MAX_YEARS) * 12;
+    const infl = safeNum(inflation);
+    return (Array.isArray(marketEvents) ? marketEvents : []).map((e) => {
+      const { start, end } = gapWindow(e, currentAge);
+      const months = Math.min(end, horizonMonths) - start;
+      if (!(end > start) || months <= 0) return null;
+      const pct = safeNum(e.returnPct);
+      let monthlyRate;
+      if (e.returnMode === "total") {
+        let factor = Math.max(1 + pct / 100, 0);
+        if (returnMode !== "real") factor = factor / Math.pow(1 + infl / 100, months / 12);
+        monthlyRate = Math.pow(Math.max(factor, 0), 1 / months) - 1;
+      } else {
+        monthlyRate = monthlyRateFor(returnMode === "real" ? pct : toReal(pct, infl));
+      }
+      if (!isFinite(monthlyRate)) monthlyRate = 0;
+      return { id: e.id, start, end, months, monthlyRate };
+    }).filter(Boolean);
+  }, [marketEvents, years, inflation, returnMode, currentAge]);
+
   const schedule = useMemo(
     () => simulateRaiseSchedule({
       currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
-      ...careerParams, stopContributingYear, contributionGaps,
+      ...careerParams, stopContributingYear, contributionGaps, marketEvents: marketPath,
     }),
-    [startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]
+    [startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps, marketPath]
   );
 
   // What the timeline changes do: the same projection with none of them, compared with the real one.
@@ -917,13 +970,24 @@ function RetirementRunwayV4() {
     const without = simulateRaiseSchedule({
       currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
-      ...careerParams, stopContributingYear, contributionGaps: [],
+      ...careerParams, stopContributingYear, contributionGaps: [], marketEvents: marketPath,
     });
     const contributionChange = schedule.contributed - without.contributed;
     const balanceChange = schedule.finalBalance - without.finalBalance;
     if (Math.abs(contributionChange) < 0.5 && Math.abs(balanceChange) < 0.5) return null;
-    return { contributionChange, balanceChange, withoutGaps: without.finalBalance };
-  }, [contributionGaps, schedule, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
+    // Same gaps with no market events, so the panel can show how the market path changes their cost.
+    let steadyBalanceChange = null;
+    if (marketPath.length) {
+      const common = {
+        currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
+        startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years,
+        ...careerParams, stopContributingYear,
+      };
+      steadyBalanceChange = simulateRaiseSchedule({ ...common, contributionGaps }).finalBalance
+        - simulateRaiseSchedule({ ...common, contributionGaps: [] }).finalBalance;
+    }
+    return { contributionChange, balanceChange, withoutGaps: without.finalBalance, steadyBalanceChange };
+  }, [contributionGaps, marketPath, schedule, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, years, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear]);
 
   const target = targetMode === "fixed" ? Number(fixedTarget) : expensePre65 / (Math.max(Number(withdrawalRate), 0.1) / 100);
 
@@ -939,10 +1003,10 @@ function RetirementRunwayV4() {
     const fn = (pct) => simulateRaiseSchedule({
       currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
       startContribution: currentAnnualContribution, raiseAllocationPct: pct, realPreReturn, years,
-      ...careerParams, stopContributingYear, contributionGaps,
+      ...careerParams, stopContributingYear, contributionGaps, marketEvents: marketPath,
     }).finalBalance;
     return solveForTarget(fn, 0, 100, target);
-  }, [startingBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
+  }, [startingBalance, salary, raisePct, currentAnnualContribution, realPreReturn, years, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps, marketPath]);
 
   const requiredFlatMonthly = useMemo(() => {
     const fn = (flatMonthly) => simulateFlatSchedule({ currentBalance: startingBalance, flatAnnual: flatMonthly * 12, realPreReturn, years });
@@ -972,11 +1036,11 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: yrs,
-        ...careerParams, stopContributingYear, contributionGaps,
+        ...careerParams, stopContributingYear, contributionGaps, marketEvents: marketPath,
       });
       return { age, balance: s.finalBalance, gap: s.finalBalance - target };
     });
-  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps, marketPath]);
 
   const gap = schedule.finalBalance - target;
   const rothAdvantagePct = ((1 - Number(currentMarginalRate) / 100) / (1 - Number(retirementMarginalRate) / 100) - 1) * 100;
@@ -1023,12 +1087,12 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
-        ...careerParams, stopContributingYear, contributionGaps,
+        ...careerParams, stopContributingYear, contributionGaps, marketEvents: marketPath,
       });
       if (s.finalBalance >= fiNumber) return age;
     }
     return null;
-  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
+  }, [currentAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, fiNumber, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps, marketPath]);
 
   const coastFireAge = useMemo(() => {
     // total trip count clamped to MAX_YEARS regardless of how extreme currentAge/retireAge are
@@ -1041,13 +1105,13 @@ function RetirementRunwayV4() {
       const s = simulateRaiseSchedule({
         currentBalance: startingBalance, salary: Number(salary), raisePct: Number(raisePct),
         startContribution: currentAnnualContribution, raiseAllocationPct: Number(raiseAllocationPct), realPreReturn, years: age - Number(currentAge),
-        ...careerParams, stopContributingYear, contributionGaps,
+        ...careerParams, stopContributingYear, contributionGaps, marketEvents: marketPath,
       });
       const coastedToRetirement = s.finalBalance * Math.pow(1 + realPreReturn / 100, Number(retireAge) - age);
       if (coastedToRetirement >= target) return age;
     }
     return null;
-  }, [currentAge, retireAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps]);
+  }, [currentAge, retireAge, startingBalance, salary, raisePct, currentAnnualContribution, raiseAllocationPct, realPreReturn, target, useRaiseSlowdown, raiseSlowdownYears, matureRaisePct, useSalaryCap, salaryCap, stopContributingYear, contributionGaps, marketPath]);
 
   // Withdrawal order: group accounts by tax treatment present, suggest a standard sequence
   const withdrawalOrderGroups = useMemo(() => {
@@ -1502,6 +1566,7 @@ function RetirementRunwayV4() {
     setRaisePct(3); setRaiseAllocationPct(0); setUseRaiseSlowdown(false); setUseSalaryCap(false); setUseStopContributing(false);
     setReturnMode("nominal"); setInflation(3); setPreReturnInput(10); setPostReturnInput(8); setShowNominalDollars(false);
     setWithdrawalRate(4); setTargetMode("expense"); setFixedTarget(2000000);
+    setMarketEvents([]);
     setAccounts([{ id: "blank1", label: "My 401k", balance: 0, monthly: 0, treatment: "Roth (after-tax)", type: "401k" }]);
     setExpenses(DEFAULT_EXPENSES.map((e) => ({ ...e, monthly: 0 })));
     setHealthcarePre65(0); setHealthcarePost65(0);
@@ -1931,6 +1996,22 @@ function RetirementRunwayV4() {
                 dollars) because that money also {gapImpact.contributionChange < 0 ? "misses out on" : "gets"} its growth.
                 {Math.abs(gapImpact.contributionChange) >= 1 && ` Every $1 ${gapImpact.contributionChange < 0 ? "skipped costs" : "added is worth"} about $${(Math.abs(gapImpact.balanceChange) / Math.abs(gapImpact.contributionChange)).toFixed(2)} at retirement.`}
               </div>
+              {gapImpact.steadyBalanceChange !== null && (() => {
+                const withEvents = -gapImpact.balanceChange;
+                const steady = -gapImpact.steadyBalanceChange;
+                const diff = withEvents - steady;
+                return (
+                  <div data-gap-steady style={{ fontSize: "12px", color: PARCHMENT, lineHeight: 1.5, marginTop: "6px", borderTop: `1px solid ${GRID}`, paddingTop: "6px" }}>
+                    With your market events: {withEvents >= 0 ? "cost" : "gain"} {fmtMoney(Math.abs(withEvents))}. With steady returns instead: {fmtMoney(Math.abs(steady))}.
+                    {Math.abs(diff) >= 1 && (
+                      <span style={{ color: diff > 0 ? RUST : TEAL }}>
+                        {" "}The market timing makes these gaps {fmtMoney(Math.abs(diff))} {diff > 0 ? "more expensive" : "cheaper"}
+                        {diff > 0 && gapImpact.contributionChange < 0 ? " — money skipped while prices are low misses buying cheap and riding the recovery." : "."}
+                      </span>
+                    )}
+                  </div>
+                );
+              })()}
             </div>
           )}
           {scenarioActive && (
@@ -1968,6 +2049,70 @@ function RetirementRunwayV4() {
             Default 10% pre-retire ≈ S&P 500's long-run nominal average (all-stock, growth phase).
             Default 8% post-retire ≈ a 60/40 stock-bond mix — a common shift toward capital preservation
             once you're drawing income, trading some growth for lower volatility year to year.
+          </div>
+
+          <div data-market-events style={{ border: `1px solid ${GRID}`, borderRadius: "4px", padding: "10px", marginBottom: "14px" }}>
+            <span className="rr-field-label" style={{ marginBottom: "4px" }}>Market events before retirement (optional)</span>
+            <div style={{ fontSize: "11px", color: MUTED, marginBottom: "8px", lineHeight: 1.5 }}>
+              Swap the steady {fmtPct(Number(preReturnInput))} return for something bumpier — a crash, a bear market, a boom —
+              to see how timing changes your balance and what a contribution gap during it costs. Returns are {returnMode}, like the inputs above.
+              After an event the market goes back to the steady return from wherever it landed, so a crash on its own is a
+              permanent drop — add a rebound after it (or use "Crash &amp; rebound") to model a recovery. Later events win where
+              they overlap. Retirement-years crashes are covered under Market Volatility.
+            </div>
+            {(Array.isArray(marketEvents) ? marketEvents : []).map((ev, ei) => {
+              const resolved = marketPath.find((m) => m.id === ev.id);
+              const { start, end } = gapWindow(ev, currentAge);
+              const update = (patch) => setMarketEvents((prev) => prev.map((x) => (x.id === ev.id ? { ...x, ...patch } : x)));
+              return (
+                <div key={ev.id} data-market-event style={{ border: `1px dashed ${BRASS}`, borderRadius: "3px", padding: "8px", marginBottom: "6px" }}>
+                  <div style={{ display: "flex", alignItems: "center", gap: "6px", marginBottom: "6px" }}>
+                    <span className="rr-field-label" style={{ color: BRASS, margin: 0, flex: 1 }}>Market event #{ei + 1}</span>
+                    <button className="rr-x-btn" title="Remove this event" onClick={() => setMarketEvents((prev) => prev.filter((x) => x.id !== ev.id))}>×</button>
+                  </div>
+                  <span className="rr-field-label">Starts</span>
+                  <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                    <input type="number" step="any" aria-label={`Market event ${ei + 1} start`} value={ev.startValue} onChange={(e) => update({ startValue: e.target.value })} style={{ flex: 1, minWidth: 0 }} />
+                    <select aria-label={`Market event ${ei + 1} start unit`} value={ev.startUnit} onChange={(e) => update({ startUnit: e.target.value })} style={{ flex: 1.4, minWidth: 0 }}>
+                      {GAP_START_UNITS.map((u) => (<option key={u.value} value={u.value}>{u.label}</option>))}
+                    </select>
+                  </div>
+                  <span className="rr-field-label">Lasts</span>
+                  <div style={{ display: "flex", gap: "6px", marginBottom: "6px" }}>
+                    {ev.lengthUnit !== "retirement" && (
+                      <input type="number" step="any" aria-label={`Market event ${ei + 1} length`} value={ev.lengthValue} onChange={(e) => update({ lengthValue: e.target.value })} style={{ flex: 1, minWidth: 0 }} />
+                    )}
+                    <select aria-label={`Market event ${ei + 1} length unit`} value={ev.lengthUnit} onChange={(e) => update({ lengthUnit: e.target.value })} style={{ flex: 1.4, minWidth: 0 }}>
+                      {GAP_LENGTH_UNITS.map((u) => (<option key={u.value} value={u.value}>{u.label}</option>))}
+                    </select>
+                  </div>
+                  <span className="rr-field-label">Market return ({returnMode})</span>
+                  <div style={{ display: "flex", gap: "6px" }}>
+                    <input type="number" step="any" aria-label={`Market event ${ei + 1} return`} value={ev.returnPct} onChange={(e) => update({ returnPct: e.target.value })} style={{ flex: 1, minWidth: 0 }} />
+                    <select aria-label={`Market event ${ei + 1} return mode`} value={ev.returnMode} onChange={(e) => update({ returnMode: e.target.value })} style={{ flex: 1.4, minWidth: 0 }}>
+                      {MARKET_RETURN_MODES.map((u) => (<option key={u.value} value={u.value}>{u.label}</option>))}
+                    </select>
+                  </div>
+                  <div className="rr-mono" style={{ fontSize: "11px", color: MUTED, marginTop: "6px", lineHeight: 1.5 }}>
+                    {resolved
+                      ? `Age ${fmtAge(safeNum(currentAge) + start / 12)} → ${end === Infinity || safeNum(currentAge) + end / 12 >= Number(retireAge) ? `retirement (${retireAge})` : fmtAge(safeNum(currentAge) + end / 12)}: market ${Math.pow(1 + resolved.monthlyRate, resolved.months) - 1 >= 0 ? "up" : "down"} ${Math.abs((Math.pow(1 + resolved.monthlyRate, resolved.months) - 1) * 100).toFixed(1)}% in total after inflation (${((Math.pow(1 + resolved.monthlyRate, 12) - 1) * 100).toFixed(1)}%/yr real), then back to the steady return.`
+                      : "Falls after retirement (or has no length), so it doesn't change the plan."}
+                  </div>
+                </div>
+              );
+            })}
+            <div style={{ display: "flex", flexWrap: "wrap", gap: "4px" }}>
+              {MARKET_PRESETS.map((pr) => (
+                <button key={pr.label} className="rr-toggle" style={{ padding: "4px 8px", fontSize: "11px" }}
+                  onClick={() => setMarketEvents((prev) => [...(Array.isArray(prev) ? prev : []), ...pr.parts.map((part) => ({ id: `mkt${idCounter++}`, startValue: part.after, startUnit: "yearsFromNow", lengthValue: part.lengthValue, lengthUnit: part.lengthUnit, returnPct: part.returnPct, returnMode: part.returnMode }))])}>
+                  + {pr.label}
+                </button>
+              ))}
+              <button className="rr-toggle" style={{ padding: "4px 8px", fontSize: "11px" }}
+                onClick={() => setMarketEvents((prev) => [...(Array.isArray(prev) ? prev : []), { id: `mkt${idCounter++}`, startValue: 0, startUnit: "yearsFromNow", lengthValue: 1, lengthUnit: "years", returnPct: 0, returnMode: "perYear" }])}>
+                + custom market event
+              </button>
+            </div>
           </div>
           {uiMode === "advanced" && (
           <div className="rr-mono" style={{ fontSize: "12px", color: MUTED, marginBottom: "16px" }}>
@@ -3171,7 +3316,8 @@ function RetirementRunwayV4() {
             {expanded.sequence && (
             <>
             <div style={{ fontSize: "12px", color: MUTED, marginBottom: "14px", lineHeight: 1.6 }}>
-              Every other number in this tool assumes a smooth, constant return every year. Real markets don't work that
+              Every other number in this tool assumes a smooth, constant return every year (apart from any market events
+              you add under Returns &amp; Inflation, which cover the years before retirement). Real markets don't work that
               way — and the <em>order</em> returns arrive in matters enormously once you're withdrawing. A crash in your
               first few retirement years forces you to sell more shares at low prices to cover the same withdrawal,
               permanently denting the portfolio even if the average return over your whole retirement ends up identical.
